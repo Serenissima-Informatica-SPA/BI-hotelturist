@@ -6,9 +6,7 @@ from Crypto.Hash import MD4
 import pandas as pd
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from azure.storage.blob import BlobServiceClient
 from io import BytesIO
-from azure.core.exceptions import ResourceExistsError
 import calendar
 import uuid
 import os
@@ -76,23 +74,47 @@ import smtplib
 # LETTURA FILE JSON #
 #####################
 
-# Ottieni la directory in cui si trova l'eseguibile
-if getattr(sys, 'frozen', False):
-    # Se il codice è eseguito come eseguibile
-    base_path = os.path.dirname(sys.executable)
-else:
-    # Se il codice è eseguito come script Python
-    base_path = os.path.dirname(os.path.abspath(__file__))
+def trova_file_configurazione():
+    candidate_dirs = []
 
-# Costruisci il percorso al file di configurazione
-config_file_path = os.path.join(base_path, 'configuration.json')
+    # Directory dell'eseguibile in caso di build frozen
+    if getattr(sys, 'frozen', False):
+        candidate_dirs.append(os.path.dirname(sys.executable))
 
-# Ora puoi usare config_file_path per leggere il tuo file di configurazione
+    # Directory dello script quando __file__ e' disponibile
+    if '__file__' in globals():
+        candidate_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+
+    # Directory da cui viene lanciato il comando
+    candidate_dirs.append(os.getcwd())
+
+    # Directory del target passato a python (se presente)
+    if len(sys.argv) > 0 and sys.argv[0]:
+        candidate_dirs.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+
+    # Rimuovi duplicati preservando l'ordine
+    dirs_uniche = []
+    for d in candidate_dirs:
+        if d and d not in dirs_uniche:
+            dirs_uniche.append(d)
+
+    percorsi_tentati = []
+    for d in dirs_uniche:
+        candidate = os.path.join(d, 'configuration.json')
+        percorsi_tentati.append(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "configuration.json non trovato. Percorsi tentati: " + " | ".join(percorsi_tentati)
+    )
+
+
+config_file_path = trova_file_configurazione()
+base_path = os.path.dirname(config_file_path)
 print(f"Percorso del file di configurazione: {config_file_path}")
 
-# Esempio di lettura del file di configurazione
-import json
-with open(config_file_path, 'r') as f:
+with open(config_file_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
     # print(config)
 
@@ -149,6 +171,94 @@ with open(config_file_path, 'r') as f:
 # LETTURA PARAMETRI
 
 connection_string = config.get('connection_string', '')
+local_output_path = config.get('local_output_path', r"C:\BC-BOARD")
+os.makedirs(local_output_path, exist_ok=True)
+
+
+class ResourceExistsError(Exception):
+    pass
+
+
+class LocalBlobDownload:
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def readall(self):
+        with open(self.file_path, 'rb') as f:
+            return f.read()
+
+    def readinto(self, stream):
+        with open(self.file_path, 'rb') as f:
+            stream.write(f.read())
+
+
+class LocalBlobClient:
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def download_blob(self):
+        return LocalBlobDownload(self.file_path)
+
+    def upload_blob(self, stream, overwrite=True):
+        if (not overwrite) and os.path.exists(self.file_path):
+            raise ResourceExistsError(f"Il file '{self.file_path}' esiste gia'.")
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        stream.seek(0)
+        with open(self.file_path, 'wb') as f:
+            f.write(stream.read())
+
+    def delete_blob(self):
+        if os.path.exists(self.file_path):
+            os.remove(self.file_path)
+
+
+class LocalBlobInfo:
+    def __init__(self, name):
+        self.name = name
+
+
+class LocalContainerClient:
+    def __init__(self, root_path, container_name):
+        self.container_path = os.path.join(root_path, container_name)
+
+    def list_blobs(self):
+        if not os.path.exists(self.container_path):
+            return []
+        blobs = []
+        for name in os.listdir(self.container_path):
+            file_path = os.path.join(self.container_path, name)
+            if os.path.isfile(file_path) and name.lower().endswith('.parquet'):
+                blobs.append(LocalBlobInfo(name))
+        return blobs
+
+    def get_blob_client(self, blob_name):
+        return LocalBlobClient(os.path.join(self.container_path, blob_name))
+
+
+class BlobServiceClient:
+    def __init__(self, root_path):
+        self.root_path = root_path
+
+    @classmethod
+    def from_connection_string(cls, _connection_string):
+        return cls(local_output_path)
+
+    def create_container(self, container_name):
+        container_path = os.path.join(self.root_path, container_name)
+        if os.path.exists(container_path):
+            raise ResourceExistsError(f"Il contenitore '{container_name}' esiste gia'.")
+        os.makedirs(container_path, exist_ok=False)
+        return LocalContainerClient(self.root_path, container_name)
+
+    def get_container_client(self, container_name):
+        return LocalContainerClient(self.root_path, container_name)
+
+    def get_blob_client(self, container=None, blob=None):
+        if container is None or blob is None:
+            raise ValueError("container e blob sono obbligatori")
+        return LocalBlobClient(os.path.join(self.root_path, container, blob))
+
+
 blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
 BC_type = config.get('BC_type', '')
