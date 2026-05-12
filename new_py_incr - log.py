@@ -1,6 +1,7 @@
 import ssl
 from requests_ntlm import HttpNtlmAuth
 import requests
+import csv
 import hashlib
 from Crypto.Hash import MD4
 import pandas as pd
@@ -12,11 +13,12 @@ import uuid
 import os
 import json
 import io
+import html
 import time
-import pyarrow as pa
-import fastparquet
 import sys
 from cryptography.fernet import Fernet
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import logging 
 import smtplib 
@@ -279,6 +281,28 @@ mese_corrente = datetime.utcnow().month
 
 # Leggi lista di company
 companies_list = config.get('companies', [])
+export_full_txt = config.get('export_full_txt', True)
+full_export_max_workers = int(config.get('full_export_max_workers', 4))
+incremental_compare_enabled = config.get('incremental_compare_enabled', True)
+incremental_compare_services = set(config.get('incremental_compare_services', ['GLEntry']))
+incremental_batch_size = int(config.get('incremental_batch_size', 100))
+incremental_batch_workers = int(config.get('incremental_batch_workers', 8))
+incremental_mode = config.get('incremental_mode', 'watermark')
+incremental_watermark_overlap_minutes = int(config.get('incremental_watermark_overlap_minutes', 15))
+incremental_partitioned_months_back = int(config.get('incremental_partitioned_months_back', 2))
+incremental_partitioned_full_reconcile_every = int(config.get('incremental_partitioned_full_reconcile_every', 0))
+incremental_skip_delete_scan_services = set(config.get('incremental_skip_delete_scan_services', []))
+incremental_changelog_delete_services = set(config.get('incremental_changelog_delete_services', ['GLEntry']))
+incremental_changelog_service_name = config.get('incremental_changelog_service_name', 'ChangeLogEntry')
+incremental_changelog_systemid_field = config.get('incremental_changelog_systemid_field', 'ChangedRecordSystemId')
+incremental_changelog_datetime_field = config.get('incremental_changelog_datetime_field', 'DateandTime')
+incremental_storage_format = str(config.get('incremental_storage_format', 'parquet')).strip().lower()
+use_parquet_incremental = incremental_storage_format == 'parquet'
+incremental_keys_format = str(
+    config.get('incremental_keys_format', 'parquet' if use_parquet_incremental else 'txt')
+).strip().lower()
+use_parquet_keys = incremental_keys_format == 'parquet'
+odata_maxpagesize = int(config.get('odata_maxpagesize', 2000))
 
 client_id = config.get('client_id_saas', '')
 client_secret = config.get('client_secret_saas', '')
@@ -314,6 +338,47 @@ def crea_contenitore_se_non_esiste(container_name):
         print(f"Il contenitore '{container_name}' esiste già.")
         # container = 'alrt'
     # return container
+
+
+def _create_http_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(['GET'])
+    )
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.headers.update({
+        'Accept': 'application/json',
+        'Content-Type': 'application/json;charset=utf-8',
+        'Connection': 'keep-alive',
+        'Accept-Encoding': 'gzip, deflate',
+        'Prefer': f'odata.maxpagesize={odata_maxpagesize}'
+    })
+    return session
+
+
+def _response_json_or_none(response, source_label):
+    content_type = response.headers.get('Content-Type', '')
+    body = response.text or ''
+    if not body.strip():
+        print(f"{source_label}: risposta vuota (status {response.status_code}, content-type {content_type})")
+        return None
+    if 'json' not in content_type.lower() and not body.lstrip().startswith('{') and not body.lstrip().startswith('['):
+        preview = body[:500].replace('\n', ' ').replace('\r', ' ')
+        print(f"{source_label}: risposta non JSON (status {response.status_code}, content-type {content_type}) - preview: {preview}")
+        return None
+    try:
+        return response.json()
+    except ValueError as exc:
+        preview = body[:500].replace('\n', ' ').replace('\r', ' ')
+        print(f"{source_label}: impossibile decodificare JSON (status {response.status_code}, content-type {content_type}) - {exc} - preview: {preview}")
+        return None
 
 # LETTURA PARQUET DA AZURE
 
@@ -423,21 +488,18 @@ hashlib.new = patched_hashlib_new
 # Function to fetch data with pagination
 def fetch_data(url, month, username, password):
     data_list = []
-    session = requests.Session()
+    session = _create_http_session()
     while url:
         try:
             response = session.get(
                 url,
                 auth=HttpNtlmAuth(username, password),
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json;charset=utf-8",
-                    "Connection": "keep-alive",
-                },
             )
             # Verify response status
             if response.status_code == 200:
-                json_data = response.json()
+                json_data = _response_json_or_none(response, f"ONPREM {month}")
+                if json_data is None:
+                    break
                 data_list.extend(json_data['value'])
                 url = json_data.get('@odata.nextLink')  # Get the next link for pagination
                 # rit = 'yes'
@@ -456,21 +518,18 @@ def fetch_data(url, month, username, password):
 
 def fetch_data_anag(url, username, password):
     data_list = []
-    session = requests.Session()
+    session = _create_http_session()
     while url:
         try:
             response = session.get(
                 url,
                 auth=HttpNtlmAuth(username, password),
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json;charset=utf-8",
-                    "Connection": "keep-alive",
-                },
             )
             # Verifica lo stato della risposta
             if response.status_code == 200:
-                json_data = response.json()
+                json_data = _response_json_or_none(response, "ANAG ONPREM")
+                if json_data is None:
+                    break
                 data_list.extend(json_data['value'])
                 url = json_data.get('@odata.nextLink')  # Ottieni il link successivo per la paginazione
             else:
@@ -527,8 +586,11 @@ def get_access_token(tenant_id, client_id, client_secret):
         }
         response = requests.post(token_url, data=data)
         response.raise_for_status()
-        tokenSaas = response.json().get('access_token')
-        tokenExpirationTime = time.time() + response.json().get('expires_in')
+        token_payload = _response_json_or_none(response, 'OAUTH TOKEN')
+        if token_payload is None:
+            raise ValueError('Risposta token OAuth non valida')
+        tokenSaas = token_payload.get('access_token')
+        tokenExpirationTime = time.time() + token_payload.get('expires_in')
 
 # def fetch_data_from_bc_saas1(tenant_id, client_id, client_secret, api_endpoint):
 #     global tokenSaas
@@ -578,6 +640,7 @@ def fetch_data_from_bc_saas(tenant_id, client_id, client_secret, api_endpoint):
         return None
 
     all_data = []
+    session = _create_http_session()
     while api_endpoint:
         # Recupera i dati dall'API di Business Central SaaS
         try:
@@ -585,15 +648,19 @@ def fetch_data_from_bc_saas(tenant_id, client_id, client_secret, api_endpoint):
                 'Authorization': f'Bearer {tokenSaas}',
                 'Accept': 'application/json',
                 'Content-Type': 'application/json;charset=utf-8',
-                'Connection': 'keep-alive'
+                'Connection': 'keep-alive',
+                'Accept-Encoding': 'gzip, deflate',
+                'Prefer': f'odata.maxpagesize={odata_maxpagesize}'
             }
-            response = requests.get(api_endpoint, headers=headers)
+            response = session.get(api_endpoint, headers=headers, timeout=120)
             response.raise_for_status()
         except Exception as exc:
             print(f'Errore nel recupero dei dati: {exc}')
             return None
 
-        data = response.json()
+        data = _response_json_or_none(response, 'SAAS BC')
+        if data is None:
+            return None
         if not response.ok:
             print(f'Errore nel recupero dei dati: {response.reason}')
             return None
@@ -608,6 +675,1127 @@ def fetch_data_from_bc_saas(tenant_id, client_id, client_secret, api_endpoint):
             return None
 
     return all_data
+
+
+def build_service_url(base_url, service_name):
+    return f"{base_url.rstrip('/')}/{service_name}"
+
+
+def salva_dataframe_txt(df, output_folder, service_name):
+    os.makedirs(output_folder, exist_ok=True)
+    output_file = os.path.join(output_folder, f"{service_name}.txt")
+    if df is None or df.empty:
+        # Crea comunque il file per mantenere un output consistente per ogni tabella.
+        with open(output_file, 'w', encoding='utf-8'):
+            pass
+        return output_file
+
+    df.to_csv(output_file, sep='\t', index=False, encoding='utf-8')
+    return output_file
+
+
+def salva_dataframe_parquet(df, output_folder, service_name):
+    os.makedirs(output_folder, exist_ok=True)
+    output_file = os.path.join(output_folder, f"{service_name}.parquet")
+    df_out = df if df is not None else pd.DataFrame()
+    df_out.to_parquet(output_file, index=False)
+    return output_file
+
+
+def _save_dataframe_output(df, output_folder, service_name, use_parquet):
+    if use_parquet:
+        return salva_dataframe_parquet(df, output_folder, service_name)
+    return salva_dataframe_txt(df, output_folder, service_name)
+
+
+def _build_filter_url(service_url, filter_expr, select_expr=None):
+    if select_expr:
+        return f"{service_url}?$filter={filter_expr}&$select={select_expr}"
+    return f"{service_url}?$filter={filter_expr}"
+
+
+def _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret):
+    if bc_type == "SAAS":
+        return fetch_data_from_bc_saas(tenant_id, client_id, client_secret, url)
+    return fetch_data(url, 'inc', username, password)
+
+
+def _fetch_keys_snapshot(service_url, bc_type, username, password, tenant_id, client_id, client_secret):
+    url = f"{service_url}?$select=SystemId,SystemModifiedAt"
+    all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+    if not all_data:
+        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+
+    df = pd.DataFrame(all_data)
+    for col in ['SystemId', 'SystemModifiedAt']:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df[['SystemId', 'SystemModifiedAt']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
+
+
+def _fetch_ids_snapshot(service_url, bc_type, username, password, tenant_id, client_id, client_secret):
+    url = f"{service_url}?$select=SystemId"
+    all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+    if not all_data:
+        return pd.DataFrame(columns=['SystemId'])
+
+    df = pd.DataFrame(all_data)
+    if 'SystemId' not in df.columns:
+        df['SystemId'] = pd.NA
+    return df[['SystemId']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
+
+
+def _fetch_id_set(service_url, bc_type, username, password, tenant_id, client_id, client_secret):
+    url = f"{service_url}?$select=SystemId"
+    all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+    if not all_data:
+        return set()
+    ids = set()
+    for row in all_data:
+        system_id = row.get('SystemId')
+        if system_id:
+            ids.add(str(system_id))
+    return ids
+
+
+def _fetch_keys_snapshot_month(service_url, col_rif, year, month,
+                               bc_type, username, password, tenant_id, client_id, client_secret):
+    start_date = datetime(year, month, 1)
+    if month == 12:
+        end_date = datetime(year + 1, 1, 1)
+    else:
+        end_date = datetime(year, month + 1, 1)
+    start_str = start_date.strftime('%Y-%m-%dT00:00:00Z')
+    end_str = end_date.strftime('%Y-%m-%dT00:00:00Z')
+    url = (f"{service_url}?$filter={col_rif} ge {start_str} and {col_rif} lt {end_str}"
+           f"&$select=SystemId,SystemModifiedAt")
+    all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+    if not all_data:
+        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+    df = pd.DataFrame(all_data)
+    for c in ['SystemId', 'SystemModifiedAt']:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[['SystemId', 'SystemModifiedAt']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
+
+
+def _load_txt_dataframe(txt_path):
+    if not os.path.exists(txt_path) or os.path.getsize(txt_path) == 0:
+        return pd.DataFrame()
+    return pd.read_csv(txt_path, sep='\t', dtype=str)
+
+
+def _load_parquet_dataframe(parquet_path):
+    if not os.path.exists(parquet_path) or os.path.getsize(parquet_path) == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(parquet_path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_keys_snapshot(keys_path):
+    candidate_paths = [keys_path]
+    if keys_path.endswith('.parquet'):
+        candidate_paths.append(keys_path[:-8] + '.txt')
+    elif keys_path.endswith('.txt'):
+        candidate_paths.append(keys_path[:-4] + '.parquet')
+
+    existing_path = None
+    for path in candidate_paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            existing_path = path
+            break
+
+    if existing_path is None:
+        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+
+    if existing_path.endswith('.parquet'):
+        df = pd.read_parquet(existing_path)
+    else:
+        df = pd.read_csv(existing_path, sep='\t', dtype=str)
+
+    for col in ['SystemId', 'SystemModifiedAt']:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df[['SystemId', 'SystemModifiedAt']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
+
+
+def _save_keys_snapshot(df_keys, keys_path):
+    os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+    if df_keys is None or df_keys.empty:
+        if keys_path.endswith('.parquet'):
+            pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']).to_parquet(keys_path, index=False)
+        else:
+            with open(keys_path, 'w', encoding='utf-8'):
+                pass
+        return
+    if keys_path.endswith('.parquet'):
+        df_keys.to_parquet(keys_path, index=False)
+    else:
+        df_keys.to_csv(keys_path, sep='\t', index=False, encoding='utf-8')
+
+
+def _keys_snapshot_path(output_folder, service_name):
+    extension = 'parquet' if use_parquet_keys else 'txt'
+    return os.path.join(output_folder, f"{service_name}__keys.{extension}")
+
+
+def _month_keys_snapshot_path(output_folder, service_name, year, month):
+    extension = 'parquet' if use_parquet_keys else 'txt'
+    return os.path.join(output_folder, f"{service_name}__keys_{year}_{month:02d}.{extension}")
+
+
+def _load_partitioned_state(state_path):
+    if not os.path.exists(state_path) or os.path.getsize(state_path) == 0:
+        return {'initialized': False, 'run_count': 0}
+    try:
+        with open(state_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {'initialized': False, 'run_count': 0}
+
+
+def _save_partitioned_state(state, state_path):
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    with open(state_path, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=True, indent=2)
+
+
+def _build_recent_months_to_process(months_back, start_year, end_year, mese_corrente):
+    all_months = [
+        (y, m)
+        for y in range(start_year, end_year + 1)
+        for m in (range(1, mese_corrente + 1) if y == end_year else range(1, 13))
+    ]
+    if months_back <= 0:
+        return all_months
+
+    now = datetime.utcnow()
+    y = now.year
+    m = now.month
+    recent = []
+    for _ in range(months_back):
+        if y < start_year:
+            break
+        if y == end_year and m > mese_corrente:
+            pass
+        elif y <= end_year:
+            recent.append((y, m))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+
+    recent_set = set(recent)
+    return [item for item in all_months if item in recent_set]
+
+
+def _write_changed_records_log(output_folder, service_name, rows):
+    log_path = os.path.join(output_folder, f"{service_name}__changes_last_run.txt")
+    os.makedirs(output_folder, exist_ok=True)
+    fieldnames = ['Action', 'SystemId', 'Year', 'Month', 'PrevSystemModifiedAt', 'CurrSystemModifiedAt']
+    with open(log_path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t', extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, '') for k in fieldnames})
+    return log_path
+
+
+def _fetch_full_rows_by_ids(service_url, ids, bc_type, username, password, tenant_id, client_id, client_secret, batch_size):
+    if not ids:
+        return pd.DataFrame()
+
+    batches = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
+    df_total = pd.DataFrame()
+
+    def fetch_batch(batch):
+        id_filters = " or ".join([f"SystemId eq {sid}" for sid in batch])
+        url = _build_filter_url(service_url, id_filters)
+        all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+        return pd.DataFrame(all_data) if all_data else pd.DataFrame()
+
+    workers = max(1, min(incremental_batch_workers, len(batches)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(fetch_batch, batch) for batch in batches]
+        for future in as_completed(futures):
+            df_batch = future.result()
+            if not df_batch.empty:
+                df_total = pd.concat([df_total, df_batch], ignore_index=True)
+    return df_total
+
+
+def _load_watermark(watermark_path):
+    if not os.path.exists(watermark_path) or os.path.getsize(watermark_path) == 0:
+        return None
+    with open(watermark_path, 'r', encoding='utf-8') as f:
+        ts = f.read().strip()
+    return ts if ts else None
+
+
+def _save_watermark(ts, watermark_path):
+    os.makedirs(os.path.dirname(watermark_path), exist_ok=True)
+    with open(watermark_path, 'w', encoding='utf-8') as f:
+        f.write(ts)
+
+
+def _fetch_since_watermark(service_url, watermark_ts, overlap_minutes,
+                           bc_type, username, password, tenant_id, client_id, client_secret):
+    try:
+        dt = datetime.strptime(watermark_ts[:19].replace(' ', 'T'), '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        dt = datetime.utcnow() - timedelta(hours=1)
+    dt_with_overlap = dt - timedelta(minutes=overlap_minutes)
+    filter_ts = dt_with_overlap.strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Alcuni endpoint BC (es. GLEntry) non supportano $orderby su SystemModifiedAt e rispondono 501.
+    url = f"{service_url}?$filter=SystemModifiedAt ge {filter_ts}"
+    return _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+
+
+def _fetch_deleted_ids_from_changelog(base_url, watermark_ts, overlap_minutes,
+                                      bc_type, username, password, tenant_id, client_id, client_secret,
+                                      changelog_service_name, changelog_systemid_field, changelog_datetime_field):
+    try:
+        dt = datetime.strptime(watermark_ts[:19].replace(' ', 'T'), '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        dt = datetime.utcnow() - timedelta(hours=1)
+
+    dt_with_overlap = dt - timedelta(minutes=overlap_minutes)
+    filter_ts = dt_with_overlap.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    changelog_url = build_service_url(base_url, changelog_service_name)
+    url = (
+        f"{changelog_url}?$filter={changelog_datetime_field} ge {filter_ts}"
+        f"&$select={changelog_systemid_field},{changelog_datetime_field}"
+    )
+    all_data = _fetch_dataset(url, bc_type, username, password, tenant_id, client_id, client_secret)
+    if not all_data:
+        return set()
+
+    deleted_ids = set()
+    for row in all_data:
+        system_id = row.get(changelog_systemid_field)
+        if system_id:
+            deleted_ids.add(str(system_id))
+    return deleted_ids
+
+
+def _upsert_by_system_id(df_base, df_delta):
+    if df_delta is None or df_delta.empty:
+        return df_base
+    if 'SystemId' not in df_delta.columns:
+        return df_base
+
+    if df_base is None or df_base.empty:
+        return df_delta.drop_duplicates(subset=['SystemId'], keep='last').reset_index(drop=True)
+
+    if 'SystemId' not in df_base.columns:
+        # Se il file storico non ha SystemId, lo sostituiamo con il delta consistente.
+        return df_delta.drop_duplicates(subset=['SystemId'], keep='last').reset_index(drop=True)
+
+    delta_ids = set(df_delta['SystemId'].dropna().astype(str))
+    base = df_base.copy()
+    base['SystemId'] = base['SystemId'].astype(str)
+    delta = df_delta.copy()
+    delta['SystemId'] = delta['SystemId'].astype(str)
+
+    base_filtered = base[~base['SystemId'].isin(delta_ids)]
+    out = pd.concat([base_filtered, delta], ignore_index=True)
+    return out.drop_duplicates(subset=['SystemId'], keep='last').reset_index(drop=True)
+
+
+def _merge_incremental_txt_file(txt_path, df_delta, deleted_ids):
+    deleted_ids = {str(item) for item in deleted_ids if pd.notna(item)}
+
+    # Fast path: nessun delta e nessun delete -> evita riscrittura completa del file.
+    if (df_delta is None or df_delta.empty or 'SystemId' not in df_delta.columns) and not deleted_ids:
+        if not os.path.exists(txt_path) or os.path.getsize(txt_path) == 0:
+            return 0
+        with open(txt_path, 'r', encoding='utf-8', newline='') as src:
+            line_count = sum(1 for _ in src)
+        return max(0, line_count - 1)
+
+    if df_delta is None or df_delta.empty or 'SystemId' not in df_delta.columns:
+        if not os.path.exists(txt_path) or os.path.getsize(txt_path) == 0:
+            return 0
+
+        temp_path = f"{txt_path}.tmp"
+        row_count = 0
+        with open(txt_path, 'r', encoding='utf-8', newline='') as src:
+            reader = csv.DictReader(src, delimiter='\t')
+            fieldnames = reader.fieldnames or []
+            with open(temp_path, 'w', encoding='utf-8', newline='') as dst:
+                writer = csv.DictWriter(dst, fieldnames=fieldnames, delimiter='\t', extrasaction='ignore')
+                writer.writeheader()
+                for row in reader:
+                    system_id = str(row.get('SystemId', ''))
+                    if system_id and system_id in deleted_ids:
+                        continue
+                    writer.writerow(row)
+                    row_count += 1
+        os.replace(temp_path, txt_path)
+        return row_count
+
+    delta_df = df_delta.copy()
+    delta_df['SystemId'] = delta_df['SystemId'].astype(str)
+    delta_rows = delta_df.to_dict('records')
+    delta_map = {str(row.get('SystemId', '')): row for row in delta_rows if str(row.get('SystemId', ''))}
+    delta_ids = set(delta_map.keys())
+
+    base_fieldnames = []
+    if os.path.exists(txt_path) and os.path.getsize(txt_path) > 0:
+        with open(txt_path, 'r', encoding='utf-8', newline='') as src:
+            reader = csv.DictReader(src, delimiter='\t')
+            base_fieldnames = reader.fieldnames or []
+
+    fieldnames = list(base_fieldnames)
+    for column in delta_df.columns:
+        if column not in fieldnames:
+            fieldnames.append(column)
+    if not fieldnames:
+        fieldnames = list(delta_df.columns)
+
+    temp_path = f"{txt_path}.tmp"
+    row_count = 0
+
+    # Percorso veloce su file grandi: merge chunked con pandas (molto piu' rapido del DictReader riga-per-riga).
+    first_write = True
+    if os.path.exists(txt_path) and os.path.getsize(txt_path) > 0:
+        try:
+            for chunk in pd.read_csv(txt_path, sep='\t', dtype=str, chunksize=100000):
+                if 'SystemId' not in chunk.columns:
+                    chunk['SystemId'] = ''
+                chunk['SystemId'] = chunk['SystemId'].fillna('').astype(str)
+
+                mask_keep = ~chunk['SystemId'].isin(deleted_ids | delta_ids)
+                chunk = chunk.loc[mask_keep].copy()
+
+                for col in fieldnames:
+                    if col not in chunk.columns:
+                        chunk[col] = ''
+                chunk = chunk[fieldnames].fillna('')
+
+                if not chunk.empty:
+                    chunk.to_csv(
+                        temp_path,
+                        sep='\t',
+                        index=False,
+                        encoding='utf-8',
+                        mode='w' if first_write else 'a',
+                        header=first_write,
+                    )
+                    row_count += len(chunk)
+                    first_write = False
+        except Exception:
+            # Fallback robusto alla logica CSV originale in caso di formati imprevisti.
+            with open(temp_path, 'w', encoding='utf-8', newline='') as dst:
+                writer = csv.DictWriter(dst, fieldnames=fieldnames, delimiter='\t', extrasaction='ignore')
+                writer.writeheader()
+                with open(txt_path, 'r', encoding='utf-8', newline='') as src:
+                    reader = csv.DictReader(src, delimiter='\t')
+                    for row in reader:
+                        system_id = str(row.get('SystemId', ''))
+                        if system_id and (system_id in deleted_ids or system_id in delta_ids):
+                            continue
+                        normalized_row = {column: row.get(column, '') for column in fieldnames}
+                        writer.writerow(normalized_row)
+                        row_count += 1
+            first_write = False
+
+    # Se non abbiamo ancora scritto nulla, crea almeno l'header.
+    if first_write:
+        pd.DataFrame(columns=fieldnames).to_csv(
+            temp_path,
+            sep='\t',
+            index=False,
+            encoding='utf-8',
+            mode='w',
+            header=True,
+        )
+        first_write = False
+
+    delta_out_rows = []
+    for system_id, row in delta_map.items():
+        if system_id in deleted_ids:
+            continue
+        delta_out_rows.append({column: row.get(column, '') for column in fieldnames})
+
+    if delta_out_rows:
+        delta_df_out = pd.DataFrame(delta_out_rows, columns=fieldnames).fillna('')
+        delta_df_out.to_csv(
+            temp_path,
+            sep='\t',
+            index=False,
+            encoding='utf-8',
+            mode='a',
+            header=False,
+        )
+        row_count += len(delta_df_out)
+
+    os.replace(temp_path, txt_path)
+    return row_count
+
+
+def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids):
+    deleted_ids = {str(item) for item in deleted_ids if pd.notna(item)}
+
+    has_delta = df_delta is not None and (not df_delta.empty) and ('SystemId' in df_delta.columns)
+    if not has_delta and not deleted_ids:
+        df_existing = _load_parquet_dataframe(parquet_path)
+        return len(df_existing)
+
+    df_base = _load_parquet_dataframe(parquet_path)
+    if not df_base.empty and 'SystemId' in df_base.columns:
+        df_base['SystemId'] = df_base['SystemId'].astype(str)
+        if deleted_ids:
+            df_base = df_base[~df_base['SystemId'].isin(deleted_ids)].reset_index(drop=True)
+
+    if has_delta:
+        df_work = df_delta.copy()
+        df_work['SystemId'] = df_work['SystemId'].astype(str)
+        if deleted_ids:
+            df_work = df_work[~df_work['SystemId'].isin(deleted_ids)].reset_index(drop=True)
+        df_out = _upsert_by_system_id(df_base, df_work)
+    else:
+        df_out = df_base
+
+    os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+    df_out.to_parquet(parquet_path, index=False)
+    return len(df_out)
+
+
+def _merge_incremental_output_file(path, df_delta, deleted_ids, use_parquet):
+    if use_parquet:
+        return _merge_incremental_parquet_file(path, df_delta, deleted_ids)
+    return _merge_incremental_txt_file(path, df_delta, deleted_ids)
+
+
+def _write_incremental_report_html(company_name, company_sanitized, rows, output_path):
+    report_file = os.path.join(output_path, f"incremental-report-{company_sanitized}.html")
+
+    if not rows:
+        body = f"""
+        <html>
+        <head><meta charset='utf-8'><style>
+            body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
+            h2 {{ margin-bottom: 8px; }}
+            p {{ color: #666; }}
+        </style></head>
+        <body>
+            <h2>Incremental report - {html.escape(company_name)}</h2>
+            <p>Nessuna tabella incrementale elaborata in questo run.</p>
+        </body>
+        </html>
+        """
+    else:
+        table_rows = []
+        for row in rows:
+            table_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('Service', '')))}</td>"
+                f"<td>{html.escape(str(row.get('Mode', '')))}</td>"
+                f"<td>{html.escape(str(row.get('Inserted', 0)))}</td>"
+                f"<td>{html.escape(str(row.get('Updated', 0)))}</td>"
+                f"<td>{html.escape(str(row.get('Deleted', 0)))}</td>"
+                f"<td>{html.escape(str(row.get('Changed', 0)))}</td>"
+                f"<td>{html.escape(str(row.get('FinalRows', 0)))}</td>"
+                f"<td>{html.escape(str(row.get('Details', '')))}</td>"
+                "</tr>"
+            )
+
+        body = f"""
+        <html>
+        <head>
+            <meta charset='utf-8'>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
+                h2 {{ margin-bottom: 4px; }}
+                .meta {{ color: #666; margin-bottom: 16px; }}
+                table {{ width: 100%; border-collapse: collapse; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; text-align: left; }}
+                th {{ background: #f3f4f6; }}
+                tr:nth-child(even) {{ background: #fafafa; }}
+            </style>
+        </head>
+        <body>
+            <h2>Incremental report - {html.escape(company_name)}</h2>
+            <div class="meta">Generato il {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Service</th>
+                        <th>Mode</th>
+                        <th>Insert</th>
+                        <th>Update</th>
+                        <th>Delete</th>
+                        <th>Changed</th>
+                        <th>Final rows</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(table_rows)}
+                </tbody>
+            </table>
+        </body>
+        </html>
+        """
+
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(body)
+    return report_file
+
+
+def export_single_service_txt(service_name, company_sanitized, base_url, bc_type, username, password,
+                              tenant_id, client_id, client_secret, local_output_path, col_rif=None):
+    table_folder = f"{service_name.replace('Qry', '').replace('_', '').lower()}-{company_sanitized}"
+    output_folder = os.path.join(local_output_path, table_folder)
+    service_url = build_service_url(base_url, service_name)
+    txt_path = os.path.join(output_folder, f"{service_name}.txt")
+    parquet_path = os.path.join(output_folder, f"{service_name}.parquet")
+    data_path = parquet_path if use_parquet_incremental else txt_path
+    keys_path = _keys_snapshot_path(output_folder, service_name)
+    report_info = {
+        'Service': service_name,
+        'Mode': 'full',
+        'Inserted': 0,
+        'Updated': 0,
+        'Deleted': 0,
+        'Changed': 0,
+        'FinalRows': 0,
+        'Details': ''
+    }
+
+    use_incremental_compare = incremental_compare_enabled and (service_name in incremental_compare_services)
+
+    if use_incremental_compare:
+        if incremental_mode == 'guaranteed_fast':
+            report_info['Mode'] = 'guaranteed_fast'
+            watermark_path = os.path.join(output_folder, f"{service_name}__watermark.txt")
+            watermark_ts = _load_watermark(watermark_path)
+            data_has_rows = os.path.exists(data_path) and os.path.getsize(data_path) > 0
+
+            prev_keys = _load_keys_snapshot(keys_path)
+            prev_keys = prev_keys[['SystemId', 'SystemModifiedAt']] if not prev_keys.empty else pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+            prev_ids_set = set(prev_keys['SystemId'].astype(str).tolist()) if not prev_keys.empty else set()
+
+            # Evita di rieseguire full load quando il watermark esiste gia':
+            # in quel caso continuiamo in incremental anche se txt/keys sono vuoti.
+            first_run = watermark_ts is None
+            if first_run:
+                all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+                df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+
+                if not df_out.empty and 'SystemId' in df_out.columns:
+                    df_keys_out = df_out[['SystemId', 'SystemModifiedAt']].copy() if 'SystemModifiedAt' in df_out.columns else df_out[['SystemId']].copy()
+                    if 'SystemModifiedAt' not in df_keys_out.columns:
+                        df_keys_out['SystemModifiedAt'] = pd.NA
+                    _save_keys_snapshot(df_keys_out, keys_path)
+                else:
+                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']), keys_path)
+
+                new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                if not df_out.empty and 'SystemModifiedAt' in df_out.columns:
+                    max_ts = df_out['SystemModifiedAt'].dropna().max()
+                    if max_ts:
+                        new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
+                _save_watermark(new_watermark, watermark_path)
+
+                report_info['Mode'] = 'initial-full'
+                report_info['FinalRows'] = len(df_out)
+                report_info['Details'] = 'Primo caricamento completo per inizializzare snapshot chiavi + watermark'
+                return service_name, len(df_out), final_txt, report_info
+
+            # Autoripristino: se esiste watermark ma txt/keys sono vuoti o mancanti,
+            # ricostruiamo il baseline corrente per evitare cancellazioni/sovrascritture incoerenti.
+            if (not data_has_rows) or prev_keys.empty:
+                all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+                df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+
+                if not df_out.empty and 'SystemId' in df_out.columns:
+                    df_keys_out = df_out[['SystemId', 'SystemModifiedAt']].copy() if 'SystemModifiedAt' in df_out.columns else df_out[['SystemId']].copy()
+                    if 'SystemModifiedAt' not in df_keys_out.columns:
+                        df_keys_out['SystemModifiedAt'] = pd.NA
+                    _save_keys_snapshot(df_keys_out, keys_path)
+                else:
+                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']), keys_path)
+
+                new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                if not df_out.empty and 'SystemModifiedAt' in df_out.columns:
+                    max_ts = df_out['SystemModifiedAt'].dropna().max()
+                    if max_ts:
+                        new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
+                _save_watermark(new_watermark, watermark_path)
+
+                report_info['Mode'] = 'rebuild-full'
+                report_info['FinalRows'] = len(df_out)
+                report_info['Details'] = 'Ricostruzione baseline: txt/keys vuoti con watermark presente'
+                return service_name, len(df_out), final_txt, report_info
+
+            if not watermark_ts:
+                watermark_ts = datetime.utcnow().strftime('%Y-%m-%dT00:00:00Z')
+
+            changed_data = _fetch_since_watermark(
+                service_url,
+                watermark_ts,
+                incremental_watermark_overlap_minutes,
+                bc_type,
+                username,
+                password,
+                tenant_id,
+                client_id,
+                client_secret
+            )
+            df_delta = pd.DataFrame(changed_data) if changed_data else pd.DataFrame()
+
+            if not df_delta.empty and 'SystemId' in df_delta.columns:
+                df_delta['SystemId'] = df_delta['SystemId'].astype(str)
+                df_delta = df_delta.drop_duplicates(subset=['SystemId'], keep='last')
+            else:
+                df_delta = pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+
+            delta_ids = set(df_delta['SystemId'].astype(str).tolist()) if not df_delta.empty and 'SystemId' in df_delta.columns else set()
+            inserted_ids = delta_ids - prev_ids_set
+            updated_ids = delta_ids & prev_ids_set
+
+            delete_mode = 'snapshot'
+            if service_name in incremental_changelog_delete_services:
+                deleted_ids = _fetch_deleted_ids_from_changelog(
+                    base_url,
+                    watermark_ts,
+                    incremental_watermark_overlap_minutes,
+                    bc_type,
+                    username,
+                    password,
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                    incremental_changelog_service_name,
+                    incremental_changelog_systemid_field,
+                    incremental_changelog_datetime_field
+                )
+                # Applica delete solo agli ID gia' presenti nello snapshot locale.
+                deleted_ids = deleted_ids & prev_ids_set
+                delete_mode = 'changelog'
+            elif service_name not in incremental_skip_delete_scan_services:
+                curr_ids_set = _fetch_id_set(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+                deleted_ids = prev_ids_set - curr_ids_set
+                delete_mode = 'snapshot'
+            else:
+                deleted_ids = set()
+                delete_mode = 'none'
+
+            no_changes = (not delta_ids) and (not deleted_ids)
+            if no_changes:
+                changes_log_path = _write_changed_records_log(output_folder, service_name, [])
+                report_info['Inserted'] = 0
+                report_info['Updated'] = 0
+                report_info['Deleted'] = 0
+                report_info['Changed'] = 0
+                report_info['FinalRows'] = len(prev_ids_set)
+                if delete_mode == 'changelog':
+                    report_info['Details'] = (
+                        f"Guaranteed-fast: nessuna variazione rilevata (watermark + {incremental_changelog_service_name}); "
+                        f"dettagli in {os.path.basename(changes_log_path)}"
+                    )
+                elif delete_mode == 'none':
+                    report_info['Details'] = (
+                        f"Guaranteed-fast (no-delete-scan): nessuna variazione rilevata; "
+                        f"dettagli in {os.path.basename(changes_log_path)}"
+                    )
+                else:
+                    report_info['Details'] = (
+                        f"Guaranteed-fast: nessuna variazione rilevata (watermark + snapshot delete); "
+                        f"dettagli in {os.path.basename(changes_log_path)}"
+                    )
+                return service_name, len(prev_ids_set), data_path, report_info
+
+            final_rows = _merge_incremental_output_file(data_path, df_delta, deleted_ids, use_parquet_incremental)
+
+            delta_keys = pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+            if not df_delta.empty:
+                if 'SystemModifiedAt' not in df_delta.columns:
+                    df_delta['SystemModifiedAt'] = pd.NA
+                delta_keys = df_delta[['SystemId', 'SystemModifiedAt']].copy()
+
+            merged_keys = _upsert_by_system_id(prev_keys, delta_keys)
+            if deleted_ids and not merged_keys.empty:
+                merged_keys = merged_keys[~merged_keys['SystemId'].astype(str).isin(deleted_ids)].reset_index(drop=True)
+            _save_keys_snapshot(merged_keys, keys_path)
+
+            new_watermark = watermark_ts
+            if not df_delta.empty and 'SystemModifiedAt' in df_delta.columns:
+                max_ts = df_delta['SystemModifiedAt'].dropna().max()
+                if max_ts:
+                    new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
+            _save_watermark(new_watermark, watermark_path)
+
+            prev_modif_map = {}
+            if not prev_keys.empty:
+                prev_modif_map = {
+                    str(row['SystemId']): str(row.get('SystemModifiedAt', ''))
+                    for _, row in prev_keys.iterrows()
+                }
+
+            changed_records_rows = []
+            if not df_delta.empty:
+                for _, row in df_delta.iterrows():
+                    sid = str(row.get('SystemId', ''))
+                    curr_mod = str(row.get('SystemModifiedAt', ''))
+                    if sid in inserted_ids:
+                        changed_records_rows.append({
+                            'Action': 'insert',
+                            'SystemId': sid,
+                            'Year': '',
+                            'Month': '',
+                            'PrevSystemModifiedAt': '',
+                            'CurrSystemModifiedAt': curr_mod
+                        })
+                    else:
+                        changed_records_rows.append({
+                            'Action': 'update',
+                            'SystemId': sid,
+                            'Year': '',
+                            'Month': '',
+                            'PrevSystemModifiedAt': prev_modif_map.get(sid, ''),
+                            'CurrSystemModifiedAt': curr_mod
+                        })
+
+            for sid in deleted_ids:
+                changed_records_rows.append({
+                    'Action': 'delete',
+                    'SystemId': sid,
+                    'Year': '',
+                    'Month': '',
+                    'PrevSystemModifiedAt': prev_modif_map.get(sid, ''),
+                    'CurrSystemModifiedAt': ''
+                })
+
+            changes_log_path = _write_changed_records_log(output_folder, service_name, changed_records_rows)
+
+            report_info['Inserted'] = len(inserted_ids)
+            report_info['Updated'] = len(updated_ids)
+            report_info['Deleted'] = len(deleted_ids)
+            report_info['Changed'] = len(inserted_ids) + len(updated_ids)
+            report_info['FinalRows'] = final_rows
+            if delete_mode == 'changelog':
+                report_info['Details'] = (
+                    f"Guaranteed-fast: insert+update da watermark, delete da {incremental_changelog_service_name}; "
+                    f"{len(inserted_ids)} insert, {len(updated_ids)} update, {len(deleted_ids)} delete; "
+                    f"dettagli in {os.path.basename(changes_log_path)}"
+                )
+            elif delete_mode == 'none':
+                report_info['Details'] = (
+                    f"Guaranteed-fast (no-delete-scan): insert+update da watermark; "
+                    f"{len(inserted_ids)} insert, {len(updated_ids)} update, delete scan disattivato per {service_name}; "
+                    f"dettagli in {os.path.basename(changes_log_path)}"
+                )
+            else:
+                report_info['Details'] = (
+                    f"Guaranteed-fast: insert+update da watermark, delete da snapshot SystemId; "
+                    f"{len(inserted_ids)} insert, {len(updated_ids)} update, {len(deleted_ids)} delete; "
+                    f"dettagli in {os.path.basename(changes_log_path)}"
+                )
+            return service_name, final_rows, data_path, report_info
+
+        if incremental_mode == 'partitioned' and col_rif:
+            report_info['Mode'] = 'partitioned'
+            state_path = os.path.join(output_folder, f"{service_name}__partitioned_state.json")
+            state = _load_partitioned_state(state_path)
+            run_count = int(state.get('run_count', 0))
+
+            if not bool(state.get('initialized', False)):
+                snapshot_exists = any(
+                    os.path.exists(_month_keys_snapshot_path(output_folder, service_name, y, m))
+                    for y in range(start_year, end_year + 1)
+                    for m in (range(1, mese_corrente + 1) if y == end_year else range(1, 13))
+                )
+                if snapshot_exists:
+                    state = {
+                        'initialized': True,
+                        'run_count': max(1, run_count),
+                        'last_run_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'last_scan_type': 'bootstrap-from-snapshots'
+                    }
+                    _save_partitioned_state(state, state_path)
+                    run_count = int(state.get('run_count', 1))
+
+            if not bool(state.get('initialized', False)):
+                # Primo run: full load e costruzione degli snapshot mensili.
+                all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+                df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                if not df_out.empty and col_rif in df_out.columns:
+                    df_out_ts = df_out.copy()
+                    df_out_ts[col_rif] = pd.to_datetime(df_out_ts[col_rif], errors='coerce', utc=True)
+                    for y in range(start_year, end_year + 1):
+                        months = range(1, mese_corrente + 1) if y == end_year else range(1, 13)
+                        for m in months:
+                            mask = (df_out_ts[col_rif].dt.year == y) & (df_out_ts[col_rif].dt.month == m)
+                            df_m = df_out_ts[mask][['SystemId', 'SystemModifiedAt']].copy() if 'SystemId' in df_out_ts.columns else pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+                            month_keys_path = _month_keys_snapshot_path(output_folder, service_name, y, m)
+                            _save_keys_snapshot(df_m, month_keys_path)
+                _save_partitioned_state(
+                    {
+                        'initialized': True,
+                        'run_count': 1,
+                        'last_run_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'last_scan_type': 'initial-full'
+                    },
+                    state_path
+                )
+                report_info['Mode'] = 'initial-full'
+                report_info['FinalRows'] = len(df_out)
+                report_info['Details'] = 'Primo caricamento completo per inizializzare gli snapshot mensili'
+                return service_name, len(df_out), final_txt, report_info
+
+            # Fetch chiavi per mese in parallelo, confronto, accumulo delta
+            all_changed_ids = []
+            all_deleted_ids = set()
+            total_inserted = 0
+            total_updated = 0
+            total_deleted = 0
+            new_month_snapshots = {}
+            changed_records_rows = []
+
+            def process_month(y, m):
+                curr_m_keys = _fetch_keys_snapshot_month(
+                    service_url, col_rif, y, m,
+                    bc_type, username, password, tenant_id, client_id, client_secret
+                )
+                month_keys_path = _month_keys_snapshot_path(output_folder, service_name, y, m)
+                prev_m_keys = _load_keys_snapshot(month_keys_path)
+                prev_idx = prev_m_keys.set_index('SystemId') if not prev_m_keys.empty else pd.DataFrame(columns=['SystemModifiedAt'])
+                curr_idx = curr_m_keys.set_index('SystemId') if not curr_m_keys.empty else pd.DataFrame(columns=['SystemModifiedAt'])
+                prev_ids = set(prev_idx.index.tolist())
+                curr_ids = set(curr_idx.index.tolist())
+                ins = curr_ids - prev_ids
+                dels = prev_ids - curr_ids
+                common = curr_ids & prev_ids
+                upd = {sid for sid in common if str(curr_idx.at[sid, 'SystemModifiedAt']) != str(prev_idx.at[sid, 'SystemModifiedAt'])}
+                changed = list(ins | upd)
+                ins_rows = [(sid, '', str(curr_idx.at[sid, 'SystemModifiedAt'])) for sid in ins]
+                upd_rows = [(sid, str(prev_idx.at[sid, 'SystemModifiedAt']), str(curr_idx.at[sid, 'SystemModifiedAt'])) for sid in upd]
+                del_rows = [(sid, str(prev_idx.at[sid, 'SystemModifiedAt']), '') for sid in dels]
+                return y, m, changed, dels, len(ins), len(upd), len(dels), curr_m_keys, ins_rows, upd_rows, del_rows
+
+            next_run_count = run_count + 1
+            full_reconcile = (
+                incremental_partitioned_full_reconcile_every > 0
+                and next_run_count % incremental_partitioned_full_reconcile_every == 0
+            )
+            if full_reconcile:
+                months_to_process = _build_recent_months_to_process(
+                    0, start_year, end_year, mese_corrente
+                )
+                scan_label = 'full-reconcile'
+            else:
+                months_to_process = _build_recent_months_to_process(
+                    incremental_partitioned_months_back, start_year, end_year, mese_corrente
+                )
+                scan_label = f"recent-{incremental_partitioned_months_back}-months"
+
+            if not months_to_process:
+                report_info['FinalRows'] = 0
+                report_info['Details'] = 'Nessun mese in finestra incrementale da processare'
+                return service_name, 0, data_path, report_info
+
+            month_workers = max(1, min(incremental_batch_workers, len(months_to_process)))
+            with ThreadPoolExecutor(max_workers=month_workers) as executor:
+                futures = [executor.submit(process_month, y, m) for y, m in months_to_process]
+                for future in as_completed(futures):
+                    y, m, changed, dels, n_ins, n_upd, n_del, curr_snap, ins_rows, upd_rows, del_rows = future.result()
+                    all_changed_ids.extend(changed)
+                    all_deleted_ids.update(dels)
+                    total_inserted += n_ins
+                    total_updated += n_upd
+                    total_deleted += n_del
+                    new_month_snapshots[(y, m)] = curr_snap
+                    for sid, prev_ts, curr_ts in ins_rows:
+                        changed_records_rows.append({
+                            'Action': 'insert',
+                            'SystemId': sid,
+                            'Year': y,
+                            'Month': f"{m:02d}",
+                            'PrevSystemModifiedAt': prev_ts,
+                            'CurrSystemModifiedAt': curr_ts
+                        })
+                    for sid, prev_ts, curr_ts in upd_rows:
+                        changed_records_rows.append({
+                            'Action': 'update',
+                            'SystemId': sid,
+                            'Year': y,
+                            'Month': f"{m:02d}",
+                            'PrevSystemModifiedAt': prev_ts,
+                            'CurrSystemModifiedAt': curr_ts
+                        })
+                    for sid, prev_ts, curr_ts in del_rows:
+                        changed_records_rows.append({
+                            'Action': 'delete',
+                            'SystemId': sid,
+                            'Year': y,
+                            'Month': f"{m:02d}",
+                            'PrevSystemModifiedAt': prev_ts,
+                            'CurrSystemModifiedAt': curr_ts
+                        })
+
+            report_info['Inserted'] = total_inserted
+            report_info['Updated'] = total_updated
+            report_info['Deleted'] = total_deleted
+            report_info['Changed'] = len(all_changed_ids)
+
+            df_delta_full = _fetch_full_rows_by_ids(
+                service_url, all_changed_ids,
+                bc_type, username, password, tenant_id, client_id, client_secret,
+                incremental_batch_size
+            )
+            final_rows = _merge_incremental_output_file(data_path, df_delta_full, all_deleted_ids, use_parquet_incremental)
+
+            # Salva snapshot mensili aggiornati
+            for (y, m), snap in new_month_snapshots.items():
+                month_keys_path = _month_keys_snapshot_path(output_folder, service_name, y, m)
+                _save_keys_snapshot(snap, month_keys_path)
+
+            changes_log_path = _write_changed_records_log(output_folder, service_name, changed_records_rows)
+            _save_partitioned_state(
+                {
+                    'initialized': True,
+                    'run_count': next_run_count,
+                    'last_run_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    'last_scan_type': scan_label,
+                    'processed_months': len(months_to_process),
+                    'changed_rows': len(changed_records_rows)
+                },
+                state_path
+            )
+
+            report_info['FinalRows'] = final_rows
+            report_info['Details'] = (
+                f"Partitioned ({scan_label}): {len(months_to_process)} mesi; "
+                f"{total_inserted} insert, {total_updated} update, {total_deleted} delete; "
+                f"{len(all_changed_ids)} record aggiornati; dettagli in {os.path.basename(changes_log_path)}"
+            )
+            return service_name, final_rows, data_path, report_info
+
+        if incremental_mode == 'watermark':
+            report_info['Mode'] = 'watermark'
+            watermark_path = os.path.join(output_folder, f"{service_name}__watermark.txt")
+            watermark_ts = _load_watermark(watermark_path)
+
+            if watermark_ts is None:
+                # Primo run: full load per inizializzare il watermark.
+                all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+                df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                if not df_out.empty and 'SystemModifiedAt' in df_out.columns:
+                    max_ts = df_out['SystemModifiedAt'].dropna().max()
+                    if max_ts:
+                        new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
+                _save_watermark(new_watermark, watermark_path)
+                report_info['Mode'] = 'initial-full'
+                report_info['FinalRows'] = len(df_out)
+                report_info['Details'] = 'Primo caricamento completo per inizializzare il watermark'
+                return service_name, len(df_out), final_txt, report_info
+
+            changed_data = _fetch_since_watermark(
+                service_url, watermark_ts, incremental_watermark_overlap_minutes,
+                bc_type, username, password, tenant_id, client_id, client_secret
+            )
+            df_delta = pd.DataFrame(changed_data) if changed_data else pd.DataFrame()
+            n_changed = len(df_delta)
+            report_info['Changed'] = n_changed
+            report_info['Inserted'] = n_changed
+            report_info['Updated'] = 0
+            report_info['Deleted'] = 0
+
+            final_rows = _merge_incremental_output_file(data_path, df_delta, set(), use_parquet_incremental)
+
+            new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            if not df_delta.empty and 'SystemModifiedAt' in df_delta.columns:
+                max_ts = df_delta['SystemModifiedAt'].dropna().max()
+                if max_ts:
+                    new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
+            _save_watermark(new_watermark, watermark_path)
+
+            report_info['FinalRows'] = final_rows
+            report_info['Details'] = (
+                f"Watermark: {watermark_ts} \u2192 {new_watermark}; "
+                f"{n_changed} record (insert+update, delete non rilevati)"
+            )
+            return service_name, final_rows, data_path, report_info
+
+        # --- modalità snapshot (confronto chiavi completo) ---
+        report_info['Mode'] = 'incremental'
+        prev_keys = _load_keys_snapshot(keys_path)
+        curr_keys = _fetch_keys_snapshot(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+
+        prev_idx = prev_keys.set_index('SystemId') if not prev_keys.empty else pd.DataFrame(columns=['SystemModifiedAt'])
+        curr_idx = curr_keys.set_index('SystemId') if not curr_keys.empty else pd.DataFrame(columns=['SystemModifiedAt'])
+
+        prev_ids = set(prev_idx.index.tolist())
+        curr_ids = set(curr_idx.index.tolist())
+
+        inserted_ids = curr_ids - prev_ids
+        deleted_ids = prev_ids - curr_ids
+        common_ids = curr_ids & prev_ids
+
+        updated_ids = {
+            sid for sid in common_ids
+            if str(curr_idx.at[sid, 'SystemModifiedAt']) != str(prev_idx.at[sid, 'SystemModifiedAt'])
+        }
+
+        changed_ids = list(inserted_ids | updated_ids)
+        report_info['Inserted'] = len(inserted_ids)
+        report_info['Updated'] = len(updated_ids)
+        report_info['Deleted'] = len(deleted_ids)
+        report_info['Changed'] = len(changed_ids)
+
+        if prev_keys.empty:
+            # Primo giro: nessun "ieri", quindi facciamo full su tutte le colonne.
+            all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
+            df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+            final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+            _save_keys_snapshot(curr_keys, keys_path)
+            report_info['Mode'] = 'initial-full'
+            report_info['FinalRows'] = len(df_out)
+            report_info['Details'] = 'Primo caricamento completo per inizializzare lo snapshot'
+            return service_name, len(df_out), final_txt, report_info
+
+        df_delta_full = _fetch_full_rows_by_ids(
+            service_url,
+            changed_ids,
+            bc_type,
+            username,
+            password,
+            tenant_id,
+            client_id,
+            client_secret,
+            incremental_batch_size
+        )
+
+        final_rows = _merge_incremental_output_file(data_path, df_delta_full, deleted_ids, use_parquet_incremental)
+        _save_keys_snapshot(curr_keys, keys_path)
+        report_info['FinalRows'] = final_rows
+        report_info['Details'] = f"Delta applicato su {len(changed_ids)} record; esclusi {len(deleted_ids)} record cancellati"
+        return service_name, final_rows, data_path, report_info
+
+    if bc_type == "SAAS":
+        all_data = fetch_data_from_bc_saas(tenant_id, client_id, client_secret, service_url)
+    else:
+        all_data = fetch_data(service_url, 'all', username, password)
+
+    df = pd.DataFrame(all_data) if all_data else pd.DataFrame()
+    txt_path = _save_dataframe_output(df, output_folder, service_name, use_parquet_incremental)
+    report_info['FinalRows'] = len(df)
+    report_info['Details'] = 'Export completo non incrementale'
+    return service_name, len(df), txt_path, report_info
 
 ######################
 # LOOP SULLE COMPANY #
@@ -645,6 +1833,50 @@ for company_config in companies_list:
     defServ_anag['ColRif'] = config.get('defServ_mov_colRif', '')
     defServ_anag['transformed_string'] = defServ_anag['Service'].apply(lambda x: x.replace("Qry", "").lower()) 
     defServ_anag['container_name_corr'] = defServ_anag['transformed_string'] + "corrente-" + company_sanitized
+
+    if export_full_txt:
+        print(f"\n--- EXPORT FULL TXT per company: {company_config['name']} ---")
+        servizi_mov = defServ[['Service', 'ColRif']].copy()
+        servizi_anag = defServ_anag[['Service', 'ColRif']].copy()
+        servizi_totali = pd.concat([servizi_mov, servizi_anag], ignore_index=True).drop_duplicates(subset=['Service'])
+        incremental_report_rows = []
+
+        workers = max(1, min(full_export_max_workers, len(servizi_totali)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {}
+            for _, service_row in servizi_totali.iterrows():
+                service_name = service_row['Service']
+                service_col_rif = service_row.get('ColRif', '') or ''
+                future = executor.submit(
+                    export_single_service_txt,
+                    service_name,
+                    company_sanitized,
+                    base_url,
+                    BC_type,
+                    username,
+                    password,
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                    local_output_path,
+                    service_col_rif
+                )
+                future_map[future] = service_name
+
+            for future in as_completed(future_map):
+                service_name = future_map[future]
+                try:
+                    service_name_ret, row_count, txt_path, report_info = future.result()
+                    print(f"Tabella {service_name_ret}: esportati {row_count} record in {txt_path}")
+                    incremental_report_rows.append(report_info)
+                except Exception as e:
+                    print(f"Errore export tabella {service_name}: {e}")
+
+        report_file = _write_incremental_report_html(company_config['name'], company_sanitized, incremental_report_rows, base_path)
+        print(f"Report incrementale salvato in {report_file}")
+
+        print(f"--- Fine EXPORT FULL TXT per company: {company_config['name']} ---\n")
+        continue
 
     # Svuota tutti i container prima di scrivere nuovi dati (per evitare dati sporchi)
     print(f"\n--- Svuotamento container per company: {company_config['name']} ---")
