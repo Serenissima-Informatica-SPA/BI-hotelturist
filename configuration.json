@@ -9,7 +9,7 @@
   ],
   "password_mail": "ygggfmembneiqagl",
   "connection_string": "",
-  "local_output_path": "C:\\BC-BOARD",
+  "local_output_path": "F:\\BC-BOARD",
   "IP": "",
   "ServiceName": "",
   "username": "",
@@ -28,7 +28,11 @@
   "incremental_batch_workers": 8,
   "incremental_storage_format": "parquet",
   "incremental_keys_format": "parquet",
+  "align_output_field_names_with_sp": true,
   "incremental_mode": "guaranteed_fast",
+  "incremental_partitioned_storage_services": [
+    "GLEntry"
+  ],
   "incremental_skip_delete_scan_services": [
     "GLEntry"
   ],
@@ -58,10 +62,10 @@
   
   "companies": [
     {
-      "name": "HOTELTURIST SPA",
-      "sanitized": "hotelturistspa",
-      "company_encoded": "Hotelturist_Spa",
-      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Sandbox/ODataV4/Company('Hotelturist_Spa')/"
+      "name": "ASYLA SRL",
+      "sanitized": "asylasrl",
+      "company_encoded": "ASYLA_SRL",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('ASYLA_SRL')/"
     }
   ]
 }

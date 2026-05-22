@@ -291,6 +291,7 @@ incremental_mode = config.get('incremental_mode', 'watermark')
 incremental_watermark_overlap_minutes = int(config.get('incremental_watermark_overlap_minutes', 15))
 incremental_partitioned_months_back = int(config.get('incremental_partitioned_months_back', 2))
 incremental_partitioned_full_reconcile_every = int(config.get('incremental_partitioned_full_reconcile_every', 0))
+incremental_partitioned_storage_services = set(config.get('incremental_partitioned_storage_services', []))
 incremental_skip_delete_scan_services = set(config.get('incremental_skip_delete_scan_services', []))
 incremental_changelog_delete_services = set(config.get('incremental_changelog_delete_services', ['GLEntry']))
 incremental_changelog_service_name = config.get('incremental_changelog_service_name', 'ChangeLogEntry')
@@ -303,6 +304,129 @@ incremental_keys_format = str(
 ).strip().lower()
 use_parquet_keys = incremental_keys_format == 'parquet'
 odata_maxpagesize = int(config.get('odata_maxpagesize', 2000))
+
+
+def _to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+align_output_field_names_with_sp = _to_bool(config.get('align_output_field_names_with_sp', True), True)
+
+
+SERVICE_FIELD_MAPS_SP = {
+    'Vendor': {
+        'No': 'No_',
+        'SearchName': 'Search Name',
+        'Name2': 'Name 2',
+        'GlobalDimension1Code': 'Global Dimension 1 Code',
+        'GlobalDimension2Code': 'Global Dimension 2 Code',
+        'CurrencyCode': 'Currency Code',
+        'VATRegistrationNo': 'VAT Registration No_',
+    },
+    'Item': {
+        'No': 'No_',
+        'ItemCategoryCode': 'Item Category Code',
+    },
+    'ItemCategory': {
+        'Code': 'Code',
+    },
+    'ValueEntryQry': {
+        'ItemNo': 'Item No_',
+        'PostingDate': 'Posting Date',
+        'LocationCode': 'Location Code',
+        'UnitofMeasureCode': 'Unit of Measure Code',
+        'CostAmountActual': 'Cost Amount',
+        'ItemLedgerEntryType': 'Item Ledger Entry Type',
+        'DocumentNo': 'Document No_',
+    },
+    'PhysInventoryLedgerEntry': {
+        'ItemNo': 'Item No_',
+        'PostingDate': 'Posting Date',
+        'LocationCode': 'Location Code',
+        'EntryType': 'Entry Type',
+        'DocumentNo': 'Document No_',
+        'Quantity': 'Qta',
+        'UnitofMeasureCode': 'Unit of Measure Code',
+    },
+    'Location': {
+        'Code': 'Code',
+        'Name': 'Name',
+    },
+    'DimensionSetEntryQry': {
+        'DimensionSetID': 'Dimension Set ID',
+        'DimensionCode': 'Dimension Code',
+        'DimensionValueCode': 'Dimension Value Code',
+        'DimensionValueID': 'Dimension Value ID',
+    },
+    'DimensionValue': {
+        'Code': 'Code',
+        'Name': 'Name',
+    },
+    'GLAccountQry': {
+        'No': 'No_',
+        'IncomeBalance': 'Income_Balance',
+        'AccountType': 'Account Type',
+    },
+    'GLEntry': {
+        'PostingDate': 'Posting Date',
+        'EntryNo': 'Entry No_',
+        'DimensionSetID': 'Dimension Set ID',
+        'GlobalDimension2Code': 'Global Dimension 2 Code',
+        'GlobalDimension1Code': 'Global Dimension 1 Code',
+        'GLAccountNo': 'G_L Account No_',
+        'DocumentNo': 'Document No_',
+        'SourceType': 'Source Type',
+        'SourceNo': 'Source No_',
+        'DocumentDate': 'Document Date',
+        'DocumentType': 'Document Type',
+        'SourceCode': 'Source Code',
+        'ExternalDocumentNo': 'External Document No_',
+    },
+}
+
+
+def _apply_sp_field_mapping(df, service_name):
+    if df is None:
+        return pd.DataFrame()
+    if df.empty or not align_output_field_names_with_sp:
+        return df
+
+    mapping = SERVICE_FIELD_MAPS_SP.get(service_name, {})
+    if not mapping:
+        return df
+
+    rename_map = {}
+    columns = set(df.columns)
+    for canonical_name, target_name in mapping.items():
+        candidates = [
+            canonical_name,
+            f'FOR_{canonical_name}',
+            canonical_name.replace('ID', 'Id'),
+            f"FOR_{canonical_name.replace('ID', 'Id')}",
+        ]
+        for candidate in candidates:
+            if candidate in columns and target_name not in columns:
+                rename_map[candidate] = target_name
+                break
+
+    if not rename_map:
+        # Fallback generico: rimuove prefisso FOR_ quando il nome pulito non esiste.
+        for col in list(columns):
+            if col.startswith('FOR_'):
+                clean = col[4:]
+                if clean and clean not in columns:
+                    rename_map[col] = clean
+
+    if not rename_map:
+        return df
+
+    return df.rename(columns=rename_map)
 
 client_id = config.get('client_id_saas', '')
 client_secret = config.get('client_secret_saas', '')
@@ -684,6 +808,7 @@ def build_service_url(base_url, service_name):
 def salva_dataframe_txt(df, output_folder, service_name):
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.txt")
+    df = _apply_sp_field_mapping(df, service_name)
     if df is None or df.empty:
         # Crea comunque il file per mantenere un output consistente per ogni tabella.
         with open(output_file, 'w', encoding='utf-8'):
@@ -697,9 +822,70 @@ def salva_dataframe_txt(df, output_folder, service_name):
 def salva_dataframe_parquet(df, output_folder, service_name):
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.parquet")
-    df_out = df if df is not None else pd.DataFrame()
+    df_out = _apply_sp_field_mapping(df, service_name)
     df_out.to_parquet(output_file, index=False)
     return output_file
+
+
+def _partition_root_path(output_folder, service_name):
+    return os.path.join(output_folder, f"{service_name}__parts")
+
+
+def _partition_file_path(output_folder, service_name, year, month):
+    return os.path.join(_partition_root_path(output_folder, service_name), f"{year}_{month:02d}.parquet")
+
+
+def _extract_partition_parts(df, col_rif):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
+
+    df_out = df.copy()
+    source_col = None
+    for candidate in [col_rif, 'SystemCreatedAt', 'SystemModifiedAt']:
+        if candidate and candidate in df_out.columns:
+            source_col = candidate
+            break
+
+    if source_col is None:
+        df_out['PartitionYear'] = pd.NA
+        df_out['PartitionMonth'] = pd.NA
+        return df_out
+
+    ts = pd.to_datetime(df_out[source_col], errors='coerce', utc=True)
+    df_out['PartitionYear'] = ts.dt.year.astype('Int64')
+    df_out['PartitionMonth'] = ts.dt.month.astype('Int64')
+    return df_out
+
+
+def _save_partitioned_parquet_output(df, output_folder, service_name, col_rif):
+    partition_root = _partition_root_path(output_folder, service_name)
+    os.makedirs(partition_root, exist_ok=True)
+    df = _apply_sp_field_mapping(df, service_name)
+
+    if df is None or df.empty:
+        return partition_root
+
+    df_parts = _extract_partition_parts(df, col_rif)
+    df_parts = df_parts.dropna(subset=['PartitionYear', 'PartitionMonth']).copy()
+    if df_parts.empty:
+        return salva_dataframe_parquet(df, output_folder, service_name)
+
+    for (year, month), df_part in df_parts.groupby(['PartitionYear', 'PartitionMonth'], dropna=True):
+        part_path = _partition_file_path(output_folder, service_name, int(year), int(month))
+        os.makedirs(os.path.dirname(part_path), exist_ok=True)
+        df_part.drop(columns=['PartitionYear', 'PartitionMonth'], errors='ignore').to_parquet(part_path, index=False)
+    return partition_root
+
+
+def _partitioned_output_has_rows(output_folder, service_name):
+    partition_root = _partition_root_path(output_folder, service_name)
+    if not os.path.exists(partition_root):
+        return False
+    for name in os.listdir(partition_root):
+        file_path = os.path.join(partition_root, name)
+        if os.path.isfile(file_path) and name.lower().endswith('.parquet') and os.path.getsize(file_path) > 0:
+            return True
+    return False
 
 
 def _save_dataframe_output(df, output_folder, service_name, use_parquet):
@@ -808,32 +994,38 @@ def _load_keys_snapshot(keys_path):
             break
 
     if existing_path is None:
-        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+        return pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
 
     if existing_path.endswith('.parquet'):
         df = pd.read_parquet(existing_path)
     else:
         df = pd.read_csv(existing_path, sep='\t', dtype=str)
 
-    for col in ['SystemId', 'SystemModifiedAt']:
+    for col in ['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']:
         if col not in df.columns:
             df[col] = pd.NA
-    return df[['SystemId', 'SystemModifiedAt']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
+    return df[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']].dropna(subset=['SystemId']).drop_duplicates(subset=['SystemId'])
 
 
 def _save_keys_snapshot(df_keys, keys_path):
     os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+    empty_keys = pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
     if df_keys is None or df_keys.empty:
         if keys_path.endswith('.parquet'):
-            pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']).to_parquet(keys_path, index=False)
+            empty_keys.to_parquet(keys_path, index=False)
         else:
             with open(keys_path, 'w', encoding='utf-8'):
                 pass
         return
+    df_out = df_keys.copy()
+    for col in ['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']:
+        if col not in df_out.columns:
+            df_out[col] = pd.NA
+    df_out = df_out[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']]
     if keys_path.endswith('.parquet'):
-        df_keys.to_parquet(keys_path, index=False)
+        df_out.to_parquet(keys_path, index=False)
     else:
-        df_keys.to_csv(keys_path, sep='\t', index=False, encoding='utf-8')
+        df_out.to_csv(keys_path, sep='\t', index=False, encoding='utf-8')
 
 
 def _keys_snapshot_path(output_folder, service_name):
@@ -1140,15 +1332,24 @@ def _merge_incremental_txt_file(txt_path, df_delta, deleted_ids):
     return row_count
 
 
-def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids):
+def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids, service_name=None):
     deleted_ids = {str(item) for item in deleted_ids if pd.notna(item)}
+
+    if service_name:
+        df_delta = _apply_sp_field_mapping(df_delta, service_name)
 
     has_delta = df_delta is not None and (not df_delta.empty) and ('SystemId' in df_delta.columns)
     if not has_delta and not deleted_ids:
         df_existing = _load_parquet_dataframe(parquet_path)
+        if service_name:
+            df_existing = _apply_sp_field_mapping(df_existing, service_name)
+            os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+            df_existing.to_parquet(parquet_path, index=False)
         return len(df_existing)
 
     df_base = _load_parquet_dataframe(parquet_path)
+    if service_name:
+        df_base = _apply_sp_field_mapping(df_base, service_name)
     if not df_base.empty and 'SystemId' in df_base.columns:
         df_base['SystemId'] = df_base['SystemId'].astype(str)
         if deleted_ids:
@@ -1168,10 +1369,59 @@ def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids):
     return len(df_out)
 
 
-def _merge_incremental_output_file(path, df_delta, deleted_ids, use_parquet):
+def _merge_incremental_output_file(path, df_delta, deleted_ids, use_parquet, service_name=None):
     if use_parquet:
-        return _merge_incremental_parquet_file(path, df_delta, deleted_ids)
+        return _merge_incremental_parquet_file(path, df_delta, deleted_ids, service_name)
     return _merge_incremental_txt_file(path, df_delta, deleted_ids)
+
+
+def _merge_partitioned_parquet_output(output_folder, service_name, df_delta, deleted_ids, prev_keys, col_rif):
+    prev_keys_work = prev_keys.copy() if prev_keys is not None else pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
+    if not prev_keys_work.empty:
+        prev_keys_work['SystemId'] = prev_keys_work['SystemId'].astype(str)
+
+    delete_partition_map = {}
+    if deleted_ids and not prev_keys_work.empty:
+        df_deleted = prev_keys_work[prev_keys_work['SystemId'].isin({str(item) for item in deleted_ids})].copy()
+        df_deleted = df_deleted.dropna(subset=['PartitionYear', 'PartitionMonth'])
+        for (year, month), df_part in df_deleted.groupby(['PartitionYear', 'PartitionMonth'], dropna=True):
+            delete_partition_map[(int(year), int(month))] = set(df_part['SystemId'].astype(str).tolist())
+
+    delta_partition_map = {}
+    if df_delta is not None and not df_delta.empty and 'SystemId' in df_delta.columns:
+        df_delta_parts = _extract_partition_parts(df_delta, col_rif)
+        df_delta_parts['SystemId'] = df_delta_parts['SystemId'].astype(str)
+        df_delta_parts = df_delta_parts.dropna(subset=['PartitionYear', 'PartitionMonth']).copy()
+
+        if not df_delta_parts.empty and not prev_keys_work.empty:
+            prev_partitions = prev_keys_work[['SystemId', 'PartitionYear', 'PartitionMonth']].copy()
+            merged_parts = df_delta_parts[['SystemId', 'PartitionYear', 'PartitionMonth']].merge(
+                prev_partitions,
+                on='SystemId',
+                how='left',
+                suffixes=('_new', '_old')
+            )
+            moved = merged_parts[
+                merged_parts['PartitionYear_old'].notna()
+                & merged_parts['PartitionMonth_old'].notna()
+                & (
+                    (merged_parts['PartitionYear_new'] != merged_parts['PartitionYear_old'])
+                    | (merged_parts['PartitionMonth_new'] != merged_parts['PartitionMonth_old'])
+                )
+            ]
+            for (year, month), df_part in moved.groupby(['PartitionYear_old', 'PartitionMonth_old'], dropna=True):
+                key = (int(year), int(month))
+                delete_partition_map.setdefault(key, set()).update(df_part['SystemId'].astype(str).tolist())
+
+        for (year, month), df_part in df_delta_parts.groupby(['PartitionYear', 'PartitionMonth'], dropna=True):
+            delta_partition_map[(int(year), int(month))] = df_part.drop(columns=['PartitionYear', 'PartitionMonth'], errors='ignore').copy()
+
+    touched_partitions = set(delete_partition_map.keys()) | set(delta_partition_map.keys())
+    for year, month in touched_partitions:
+        part_path = _partition_file_path(output_folder, service_name, year, month)
+        part_delta = delta_partition_map.get((year, month), pd.DataFrame())
+        part_deleted = delete_partition_map.get((year, month), set())
+        _merge_incremental_parquet_file(part_path, part_delta, part_deleted, service_name)
 
 
 def _write_incremental_report_html(company_name, company_sanitized, rows, output_path):
@@ -1257,7 +1507,8 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
     service_url = build_service_url(base_url, service_name)
     txt_path = os.path.join(output_folder, f"{service_name}.txt")
     parquet_path = os.path.join(output_folder, f"{service_name}.parquet")
-    data_path = parquet_path if use_parquet_incremental else txt_path
+    use_partitioned_storage = use_parquet_incremental and (service_name in incremental_partitioned_storage_services) and bool(col_rif)
+    data_path = _partition_root_path(output_folder, service_name) if use_partitioned_storage else (parquet_path if use_parquet_incremental else txt_path)
     keys_path = _keys_snapshot_path(output_folder, service_name)
     report_info = {
         'Service': service_name,
@@ -1277,10 +1528,10 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             report_info['Mode'] = 'guaranteed_fast'
             watermark_path = os.path.join(output_folder, f"{service_name}__watermark.txt")
             watermark_ts = _load_watermark(watermark_path)
-            data_has_rows = os.path.exists(data_path) and os.path.getsize(data_path) > 0
+            data_has_rows = _partitioned_output_has_rows(output_folder, service_name) if use_partitioned_storage else (os.path.exists(data_path) and os.path.getsize(data_path) > 0)
 
             prev_keys = _load_keys_snapshot(keys_path)
-            prev_keys = prev_keys[['SystemId', 'SystemModifiedAt']] if not prev_keys.empty else pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+            prev_keys = prev_keys[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']] if not prev_keys.empty else pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
             prev_ids_set = set(prev_keys['SystemId'].astype(str).tolist()) if not prev_keys.empty else set()
 
             # Evita di rieseguire full load quando il watermark esiste gia':
@@ -1289,15 +1540,16 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             if first_run:
                 all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
-                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
 
                 if not df_out.empty and 'SystemId' in df_out.columns:
-                    df_keys_out = df_out[['SystemId', 'SystemModifiedAt']].copy() if 'SystemModifiedAt' in df_out.columns else df_out[['SystemId']].copy()
+                    df_keys_out = _extract_partition_parts(df_out, col_rif)
+                    df_keys_out = df_keys_out[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']].copy() if 'SystemModifiedAt' in df_keys_out.columns else df_keys_out[['SystemId', 'PartitionYear', 'PartitionMonth']].copy()
                     if 'SystemModifiedAt' not in df_keys_out.columns:
                         df_keys_out['SystemModifiedAt'] = pd.NA
                     _save_keys_snapshot(df_keys_out, keys_path)
                 else:
-                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']), keys_path)
+                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']), keys_path)
 
                 new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
                 if not df_out.empty and 'SystemModifiedAt' in df_out.columns:
@@ -1316,15 +1568,16 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             if (not data_has_rows) or prev_keys.empty:
                 all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
-                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
 
                 if not df_out.empty and 'SystemId' in df_out.columns:
-                    df_keys_out = df_out[['SystemId', 'SystemModifiedAt']].copy() if 'SystemModifiedAt' in df_out.columns else df_out[['SystemId']].copy()
+                    df_keys_out = _extract_partition_parts(df_out, col_rif)
+                    df_keys_out = df_keys_out[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']].copy() if 'SystemModifiedAt' in df_keys_out.columns else df_keys_out[['SystemId', 'PartitionYear', 'PartitionMonth']].copy()
                     if 'SystemModifiedAt' not in df_keys_out.columns:
                         df_keys_out['SystemModifiedAt'] = pd.NA
                     _save_keys_snapshot(df_keys_out, keys_path)
                 else:
-                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt']), keys_path)
+                    _save_keys_snapshot(pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']), keys_path)
 
                 new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
                 if not df_out.empty and 'SystemModifiedAt' in df_out.columns:
@@ -1416,18 +1669,22 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                     )
                 return service_name, len(prev_ids_set), data_path, report_info
 
-            final_rows = _merge_incremental_output_file(data_path, df_delta, deleted_ids, use_parquet_incremental)
-
-            delta_keys = pd.DataFrame(columns=['SystemId', 'SystemModifiedAt'])
+            delta_keys = pd.DataFrame(columns=['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth'])
             if not df_delta.empty:
                 if 'SystemModifiedAt' not in df_delta.columns:
                     df_delta['SystemModifiedAt'] = pd.NA
-                delta_keys = df_delta[['SystemId', 'SystemModifiedAt']].copy()
+                delta_keys = _extract_partition_parts(df_delta, col_rif)[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']].copy()
+
+            if use_partitioned_storage:
+                _merge_partitioned_parquet_output(output_folder, service_name, df_delta, deleted_ids, prev_keys, col_rif)
+            else:
+                _merge_incremental_output_file(data_path, df_delta, deleted_ids, use_parquet_incremental, service_name)
 
             merged_keys = _upsert_by_system_id(prev_keys, delta_keys)
             if deleted_ids and not merged_keys.empty:
                 merged_keys = merged_keys[~merged_keys['SystemId'].astype(str).isin(deleted_ids)].reset_index(drop=True)
             _save_keys_snapshot(merged_keys, keys_path)
+            final_rows = len(merged_keys)
 
             new_watermark = watermark_ts
             if not df_delta.empty and 'SystemModifiedAt' in df_delta.columns:
@@ -1530,7 +1787,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                 # Primo run: full load e costruzione degli snapshot mensili.
                 all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
-                final_txt = _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
                 if not df_out.empty and col_rif in df_out.columns:
                     df_out_ts = df_out.copy()
                     df_out_ts[col_rif] = pd.to_datetime(df_out_ts[col_rif], errors='coerce', utc=True)
@@ -1655,7 +1912,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                 bc_type, username, password, tenant_id, client_id, client_secret,
                 incremental_batch_size
             )
-            final_rows = _merge_incremental_output_file(data_path, df_delta_full, all_deleted_ids, use_parquet_incremental)
+            final_rows = _merge_incremental_output_file(data_path, df_delta_full, all_deleted_ids, use_parquet_incremental, service_name)
 
             # Salva snapshot mensili aggiornati
             for (y, m), snap in new_month_snapshots.items():
@@ -1715,7 +1972,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             report_info['Updated'] = 0
             report_info['Deleted'] = 0
 
-            final_rows = _merge_incremental_output_file(data_path, df_delta, set(), use_parquet_incremental)
+            final_rows = _merge_incremental_output_file(data_path, df_delta, set(), use_parquet_incremental, service_name)
 
             new_watermark = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             if not df_delta.empty and 'SystemModifiedAt' in df_delta.columns:
@@ -1780,7 +2037,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             incremental_batch_size
         )
 
-        final_rows = _merge_incremental_output_file(data_path, df_delta_full, deleted_ids, use_parquet_incremental)
+        final_rows = _merge_incremental_output_file(data_path, df_delta_full, deleted_ids, use_parquet_incremental, service_name)
         _save_keys_snapshot(curr_keys, keys_path)
         report_info['FinalRows'] = final_rows
         report_info['Details'] = f"Delta applicato su {len(changed_ids)} record; esclusi {len(deleted_ids)} record cancellati"
