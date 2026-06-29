@@ -101,10 +101,14 @@ def trova_file_configurazione():
             dirs_uniche.append(d)
 
     percorsi_tentati = []
+    print(f"\nDEBUG - Cercando configuration.json nei seguenti percorsi:")
     for d in dirs_uniche:
         candidate = os.path.join(d, 'configuration.json')
         percorsi_tentati.append(candidate)
-        if os.path.isfile(candidate):
+        exists = os.path.isfile(candidate)
+        print(f"  {'✓' if exists else '✗'} {candidate}")
+        if exists:
+            print(f"\n✓ TROVATO: {candidate}\n")
             return candidate
 
     raise FileNotFoundError(
@@ -114,10 +118,17 @@ def trova_file_configurazione():
 
 config_file_path = trova_file_configurazione()
 base_path = os.path.dirname(config_file_path)
+print(f"\n{'='*80}")
 print(f"Percorso del file di configurazione: {config_file_path}")
+print(f"File esiste: {os.path.isfile(config_file_path)}")
+print(f"Path assoluto: {os.path.abspath(config_file_path)}")
+print(f"{'='*80}\n")
 
 with open(config_file_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
+    
+print(f"DEBUG - local_output_path dal config: {config.get('local_output_path')}")
+print(f"DEBUG - Numero companies: {len(config.get('companies', []))}\n")
     # print(config)
 
 # PER DECRIPTARE LE CREDENZIALI
@@ -391,6 +402,33 @@ SERVICE_FIELD_MAPS_SP = {
 }
 
 
+def _find_source_column(columns, canonical_name):
+    lower_map = {col.lower(): col for col in columns}
+
+    base_variants = [
+        canonical_name,
+        canonical_name.replace('ID', 'Id'),
+    ]
+    candidates = []
+    for variant in base_variants:
+        candidates.append(variant)
+        candidates.append(f'FOR_{variant}')
+
+    for candidate in candidates:
+        matched = lower_map.get(candidate.lower())
+        if matched:
+            return matched
+
+    # Gestisce colonne prefissate dal servizio, es. ITM_ItemNo, VE_PostingDate, GLE_GLAccountNo.
+    for col in columns:
+        col_lower = col.lower()
+        for candidate in candidates:
+            if col_lower.endswith('_' + candidate.lower()):
+                return col
+
+    return None
+
+
 def _apply_sp_field_mapping(df, service_name):
     if df is None:
         return pd.DataFrame()
@@ -402,31 +440,43 @@ def _apply_sp_field_mapping(df, service_name):
         return df
 
     rename_map = {}
-    columns = set(df.columns)
-    for canonical_name, target_name in mapping.items():
-        candidates = [
-            canonical_name,
-            f'FOR_{canonical_name}',
-            canonical_name.replace('ID', 'Id'),
-            f"FOR_{canonical_name.replace('ID', 'Id')}",
-        ]
-        for candidate in candidates:
-            if candidate in columns and target_name not in columns:
-                rename_map[candidate] = target_name
-                break
+    columns = list(df.columns)
+    occupied_targets = {col.lower() for col in columns}
+    used_sources = set()
 
-    if not rename_map:
-        # Fallback generico: rimuove prefisso FOR_ quando il nome pulito non esiste.
-        for col in list(columns):
-            if col.startswith('FOR_'):
-                clean = col[4:]
-                if clean and clean not in columns:
-                    rename_map[col] = clean
+    for canonical_name, target_name in mapping.items():
+        if target_name.lower() in occupied_targets:
+            continue
+
+        source_col = _find_source_column(columns, canonical_name)
+        if source_col and source_col not in used_sources:
+            rename_map[source_col] = target_name
+            used_sources.add(source_col)
+            occupied_targets.add(target_name.lower())
+
+    # Fallback generico: rimuove prefisso FOR_ quando il nome pulito non esiste.
+    for col in columns:
+        if col.lower().startswith('for_') and col not in rename_map:
+            clean = col[4:]
+            clean_lower = clean.lower()
+            if clean and clean_lower not in occupied_targets:
+                rename_map[col] = clean
+                occupied_targets.add(clean_lower)
 
     if not rename_map:
         return df
 
     return df.rename(columns=rename_map)
+
+
+def _add_reference_company(df, company_sanitized):
+    if df is None:
+        return pd.DataFrame()
+
+    df_out = df.copy()
+    if 'ReferenceCompany' not in df_out.columns:
+        df_out['ReferenceCompany'] = company_sanitized
+    return df_out
 
 client_id = config.get('client_id_saas', '')
 client_secret = config.get('client_secret_saas', '')
@@ -577,10 +627,18 @@ def svuota_container(container_name):
     except Exception as e:
         print(f"Errore durante lo svuotamento del container '{container_name}': {e}")
 
-def carica_parquet_su_azure(df, container_name, blob_name):
+def carica_parquet_su_azure(df, container_name, blob_name, company_sanitized=None):
+    # Se company_sanitized non è fornito, prova a estrarlo dal container_name
+    if company_sanitized is None and '-' in container_name:
+        # container_name ha formato: "{service}-{company_sanitized}"
+        company_sanitized = container_name.split('-', 1)[1] if '-' in container_name else None
+    
+    # Aggiungi la colonna ReferenceCompany se non presente
+    df_out = _add_reference_company(df, company_sanitized) if company_sanitized else df
+    
     # Convertire il DataFrame in un buffer di memoria
     stream = BytesIO()
-    df.to_parquet(stream, index=False)
+    df_out.to_parquet(stream, index=False)
     stream.seek(0)
 
     # Creare un client del blob
@@ -805,9 +863,10 @@ def build_service_url(base_url, service_name):
     return f"{base_url.rstrip('/')}/{service_name}"
 
 
-def salva_dataframe_txt(df, output_folder, service_name):
+def salva_dataframe_txt(df, output_folder, service_name, company_sanitized=None):
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.txt")
+    df = _add_reference_company(df, company_sanitized) if company_sanitized else df
     df = _apply_sp_field_mapping(df, service_name)
     if df is None or df.empty:
         # Crea comunque il file per mantenere un output consistente per ogni tabella.
@@ -819,9 +878,10 @@ def salva_dataframe_txt(df, output_folder, service_name):
     return output_file
 
 
-def salva_dataframe_parquet(df, output_folder, service_name):
+def salva_dataframe_parquet(df, output_folder, service_name, company_sanitized=None):
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.parquet")
+    df = _add_reference_company(df, company_sanitized) if company_sanitized else df
     df_out = _apply_sp_field_mapping(df, service_name)
     df_out.to_parquet(output_file, index=False)
     return output_file
@@ -857,18 +917,23 @@ def _extract_partition_parts(df, col_rif):
     return df_out
 
 
-def _save_partitioned_parquet_output(df, output_folder, service_name, col_rif):
+def _save_partitioned_parquet_output(df, output_folder, service_name, col_rif, company_sanitized=None):
     partition_root = _partition_root_path(output_folder, service_name)
     os.makedirs(partition_root, exist_ok=True)
-    df = _apply_sp_field_mapping(df, service_name)
+    df = _add_reference_company(df, company_sanitized) if company_sanitized else df
 
     if df is None or df.empty:
         return partition_root
 
+    # Estrai partizioni PRIMA di applicare il mapping SP, così ReferenceCompany rimane
     df_parts = _extract_partition_parts(df, col_rif)
     df_parts = df_parts.dropna(subset=['PartitionYear', 'PartitionMonth']).copy()
+    
+    # Applica mapping DOPO estrazione partizioni
+    df_parts = _apply_sp_field_mapping(df_parts, service_name)
+    
     if df_parts.empty:
-        return salva_dataframe_parquet(df, output_folder, service_name)
+        return salva_dataframe_parquet(df, output_folder, service_name, company_sanitized=company_sanitized)
 
     for (year, month), df_part in df_parts.groupby(['PartitionYear', 'PartitionMonth'], dropna=True):
         part_path = _partition_file_path(output_folder, service_name, int(year), int(month))
@@ -888,10 +953,10 @@ def _partitioned_output_has_rows(output_folder, service_name):
     return False
 
 
-def _save_dataframe_output(df, output_folder, service_name, use_parquet):
+def _save_dataframe_output(df, output_folder, service_name, use_parquet, company_sanitized=None):
     if use_parquet:
-        return salva_dataframe_parquet(df, output_folder, service_name)
-    return salva_dataframe_txt(df, output_folder, service_name)
+        return salva_dataframe_parquet(df, output_folder, service_name, company_sanitized=company_sanitized)
+    return salva_dataframe_txt(df, output_folder, service_name, company_sanitized=company_sanitized)
 
 
 def _build_filter_url(service_url, filter_expr, select_expr=None):
@@ -1540,7 +1605,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             if first_run:
                 all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
-                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif, company_sanitized) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental, company_sanitized)
 
                 if not df_out.empty and 'SystemId' in df_out.columns:
                     df_keys_out = _extract_partition_parts(df_out, col_rif)
@@ -1568,7 +1633,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             if (not data_has_rows) or prev_keys.empty:
                 all_data = _fetch_dataset(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 df_out = pd.DataFrame(all_data) if all_data else pd.DataFrame()
-                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental)
+                final_txt = _save_partitioned_parquet_output(df_out, output_folder, service_name, col_rif, company_sanitized) if use_partitioned_storage else _save_dataframe_output(df_out, output_folder, service_name, use_parquet_incremental, company_sanitized)
 
                 if not df_out.empty and 'SystemId' in df_out.columns:
                     df_keys_out = _extract_partition_parts(df_out, col_rif)
@@ -2058,6 +2123,12 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
 # LOOP SULLE COMPANY #
 ######################
 
+print(f"\n{'='*80}")
+print(f"ELABORAZIONE INIZIATA - {len(companies_list)} COMPANY DA PROCESSARE")
+for i, c in enumerate(companies_list, 1):
+    print(f"  {i}. {c['name']} ({c['sanitized']})")
+print(f"{'='*80}\n")
+
 # Inizializza log globali
 all_log_data_agginc = []
 all_log_data_storico = []
@@ -2066,7 +2137,7 @@ all_log_data_anag = []
 # Cicla su tutte le company configurate
 for company_config in companies_list:
     print(f"\n{'='*80}")
-    print(f"ELABORAZIONE COMPANY: {company_config['name']}")
+    print(f"INIZIO ELABORAZIONE: {company_config['name']} ({company_config['sanitized']})")
     print(f"{'='*80}\n")
     
     # Imposta variabili specifiche per la company
@@ -3646,6 +3717,9 @@ for company_config in companies_list:
             all_log_data_storico.extend(log_data_storico)
         if 'log_data_anag' in locals():
             all_log_data_anag.extend(log_data_anag)
+    
+    print(f"\n✓ FINE ELABORAZIONE: {company_config['name']} - OK")
+    print(f"{'='*80}\n")
     
 # Fine loop company
 

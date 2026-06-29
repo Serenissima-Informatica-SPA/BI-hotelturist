@@ -9,8 +9,10 @@ import pandas as pd
 SERVICE_FIELD_MAPS_SP = {
     'Vendor': {
         'No': 'No_',
+        'Name': 'Name',
         'SearchName': 'Search Name',
         'Name2': 'Name 2',
+        'City': 'City',
         'GlobalDimension1Code': 'Global Dimension 1 Code',
         'GlobalDimension2Code': 'Global Dimension 2 Code',
         'CurrencyCode': 'Currency Code',
@@ -18,7 +20,13 @@ SERVICE_FIELD_MAPS_SP = {
     },
     'Item': {
         'No': 'No_',
+        'ItemNo': 'No_',
+        'ItemDescription': 'Description',
         'ItemCategoryCode': 'Item Category Code',
+    },
+    'ItemCategory': {
+        'Code': 'Code',
+        'Description': 'Description',
     },
     'ValueEntryQry': {
         'ItemNo': 'Item No_',
@@ -38,24 +46,36 @@ SERVICE_FIELD_MAPS_SP = {
         'Quantity': 'Qta',
         'UnitofMeasureCode': 'Unit of Measure Code',
     },
+    'Location': {
+        'Code': 'Code',
+        'Name': 'Name',
+    },
     'DimensionSetEntryQry': {
         'DimensionSetID': 'Dimension Set ID',
         'DimensionCode': 'Dimension Code',
         'DimensionValueCode': 'Dimension Value Code',
         'DimensionValueID': 'Dimension Value ID',
+        'DimensionValueName': 'Name',
+    },
+    'DimensionValue': {
+        'Code': 'Code',
+        'Name': 'Name',
     },
     'GLAccountQry': {
         'No': 'No_',
+        'Name': 'Name',
         'IncomeBalance': 'Income_Balance',
         'AccountType': 'Account Type',
     },
     'GLEntry': {
         'PostingDate': 'Posting Date',
         'EntryNo': 'Entry No_',
+        'Description': 'Description',
         'DimensionSetID': 'Dimension Set ID',
         'GlobalDimension2Code': 'Global Dimension 2 Code',
         'GlobalDimension1Code': 'Global Dimension 1 Code',
         'GLAccountNo': 'G_L Account No_',
+        'Amount': 'Amount',
         'DocumentNo': 'Document No_',
         'SourceType': 'Source Type',
         'SourceNo': 'Source No_',
@@ -65,6 +85,35 @@ SERVICE_FIELD_MAPS_SP = {
         'ExternalDocumentNo': 'External Document No_',
     },
 }
+
+KEEP_ONLY_MAPPED_FIELDS = True
+
+
+def _find_source_column(columns, canonical_name):
+    lower_map = {col.lower(): col for col in columns}
+
+    base_variants = [
+        canonical_name,
+        canonical_name.replace('ID', 'Id'),
+    ]
+    candidates = []
+    for variant in base_variants:
+        candidates.append(variant)
+        candidates.append(f'FOR_{variant}')
+
+    for candidate in candidates:
+        matched = lower_map.get(candidate.lower())
+        if matched:
+            return matched
+
+    # Gestisce colonne prefissate dal servizio, es. ITM_ItemNo, VE_PostingDate, GLE_GLAccountNo.
+    for col in columns:
+        col_lower = col.lower()
+        for candidate in candidates:
+            if col_lower.endswith('_' + candidate.lower()):
+                return col
+
+    return None
 
 
 def _apply_sp_field_mapping(df, service_name):
@@ -76,30 +125,58 @@ def _apply_sp_field_mapping(df, service_name):
         return df
 
     rename_map = {}
-    columns = set(df.columns)
+    columns = list(df.columns)
+    occupied_targets = {col.lower() for col in columns}
+    used_sources = set()
+
     for canonical_name, target_name in mapping.items():
-        candidates = [
-            canonical_name,
-            f'FOR_{canonical_name}',
-            canonical_name.replace('ID', 'Id'),
-            f"FOR_{canonical_name.replace('ID', 'Id')}",
-        ]
-        for candidate in candidates:
-            if candidate in columns and target_name not in columns:
-                rename_map[candidate] = target_name
-                break
+        if target_name.lower() in occupied_targets:
+            continue
 
-    if not rename_map:
-        # Fallback generico: rimuove prefisso FOR_ quando il nome pulito non esiste.
-        for col in list(columns):
-            if col.startswith('FOR_'):
-                clean = col[4:]
-                if clean and clean not in columns:
-                    rename_map[col] = clean
+        source_col = _find_source_column(columns, canonical_name)
+        if source_col and source_col not in used_sources:
+            rename_map[source_col] = target_name
+            used_sources.add(source_col)
+            occupied_targets.add(target_name.lower())
 
-    if not rename_map:
-        return df
-    return df.rename(columns=rename_map)
+    # Fallback generico: rimuove prefisso FOR_ quando il nome pulito non esiste.
+    for col in columns:
+        if col.lower().startswith('for_') and col not in rename_map:
+            clean = col[4:]
+            clean_lower = clean.lower()
+            if clean and clean_lower not in occupied_targets:
+                rename_map[col] = clean
+                occupied_targets.add(clean_lower)
+
+    df_out = df.rename(columns=rename_map) if rename_map else df
+
+    if not KEEP_ONLY_MAPPED_FIELDS:
+        return df_out
+
+    ordered_targets = []
+    current_columns = {col.lower(): col for col in df_out.columns}
+    for target_name in mapping.values():
+        actual = current_columns.get(target_name.lower())
+        if actual and actual not in ordered_targets:
+            ordered_targets.append(actual)
+
+    if not ordered_targets:
+        return df_out
+
+    if 'ReferenceCompany' in df_out.columns and 'ReferenceCompany' not in ordered_targets:
+        ordered_targets.append('ReferenceCompany')
+
+    return df_out[ordered_targets]
+
+
+def _add_reference_company(df, company_sanitized):
+    if df is None:
+        return pd.DataFrame()
+
+    df_out = df.copy()
+    if 'ReferenceCompany' not in df_out.columns:
+        df_out['ReferenceCompany'] = company_sanitized
+    return df_out
 
 
 def trova_file_configurazione():
@@ -144,16 +221,17 @@ def _write_txt(df, txt_path):
             pass
         return 0
 
-    df.to_csv(txt_path, sep='\t', index=False, encoding='utf-8')
+    df.to_csv(txt_path, sep='§', index=False, encoding='utf-8')
     return len(df)
 
 
-def _convert_single_parquet(parquet_path, txt_path):
+def _convert_single_parquet(parquet_path, txt_path, company_sanitized):
     if not os.path.exists(parquet_path) or os.path.getsize(parquet_path) == 0:
         return False, 0, f'Parquet non trovato o vuoto: {parquet_path}'
 
     try:
         df = pd.read_parquet(parquet_path)
+        df = _add_reference_company(df, company_sanitized)
         service_name = os.path.splitext(os.path.basename(parquet_path))[0]
         df = _apply_sp_field_mapping(df, service_name)
         rows = _write_txt(df, txt_path)
@@ -162,7 +240,7 @@ def _convert_single_parquet(parquet_path, txt_path):
         return False, 0, f'Errore conversione {parquet_path}: {exc}'
 
 
-def _convert_partitioned_parquet(partition_dir, txt_path):
+def _convert_partitioned_parquet(partition_dir, txt_path, company_sanitized):
     if not os.path.isdir(partition_dir):
         return False, 0, f'Cartella partizioni non trovata: {partition_dir}'
 
@@ -187,6 +265,7 @@ def _convert_partitioned_parquet(partition_dir, txt_path):
                 continue
 
             df_part = pd.read_parquet(parquet_file)
+            df_part = _add_reference_company(df_part, company_sanitized)
             df_part = _apply_sp_field_mapping(df_part, service_name)
 
             if expected_columns is None:
@@ -202,7 +281,7 @@ def _convert_partitioned_parquet(partition_dir, txt_path):
 
             df_part.to_csv(
                 txt_path,
-                sep='\t',
+                sep='§',
                 index=False,
                 encoding='utf-8',
                 mode='w' if first_write else 'a',
@@ -260,9 +339,9 @@ def main():
             partition_dir = os.path.join(output_folder, f'{service_name}__parts')
 
             if os.path.isdir(partition_dir):
-                ok, rows, message = _convert_partitioned_parquet(partition_dir, txt_path)
+                ok, rows, message = _convert_partitioned_parquet(partition_dir, txt_path, company_sanitized)
             else:
-                ok, rows, message = _convert_single_parquet(parquet_path, txt_path)
+                ok, rows, message = _convert_single_parquet(parquet_path, txt_path, company_sanitized)
 
             details.append((ok, service_name, company_sanitized, rows, message))
             if ok:

@@ -9,7 +9,7 @@
   ],
   "password_mail": "ygggfmembneiqagl",
   "connection_string": "",
-  "local_output_path": "F:\\BC-BOARD",
+  "local_output_path": "\\\\sql\\BC_BOARD",
   "IP": "",
   "ServiceName": "",
   "username": "",
@@ -59,13 +59,42 @@
 
   "start_year": 2023,
   "current_year": 2025,
-  
   "companies": [
     {
       "name": "ASYLA SRL",
       "sanitized": "asylasrl",
       "company_encoded": "ASYLA_SRL",
       "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('ASYLA_SRL')/"
+    },
+    {
+      "name": "GESTIONI TOURING TH",
+      "sanitized": "gestionitouringth",
+      "company_encoded": "GESTIONI_TOURING_TH",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('GESTIONI_TOURING_TH')/"
+    },
+    {
+      "name": "Hotelturist Spa",
+      "sanitized": "hotelturistspa",
+      "company_encoded": "Hotelturist_Spa",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Hotelturist_Spa')/"
+    },
+    {
+      "name": "Laudato Srl",
+      "sanitized": "laudatosrl",
+      "company_encoded": "Laudato%20Srl",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Laudato%20Srl')/"
+    },
+    {
+      "name": "Mountain Resort Srl",
+      "sanitized": "mountainresortsrl",
+      "company_encoded": "Mountain_Resort_Srl",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Mountain_Resort_Srl')/"
+    },
+    {
+      "name": "TOURISM HOTEL ENGINEERING",
+      "sanitized": "tourismhotelengineering",
+      "company_encoded": "TOURISM_HOTEL_ENGINEERING",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('TOURISM_HOTEL_ENGINEERING')/"
     }
   ]
 }
