@@ -1,0 +1,16 @@
+# Ignore all files by default
+*
+
+# Whitelist Python and JSON files
+!*.py
+!*.json
+
+# Whitelist .gitignore itself
+!.gitignore
+
+# Ignore build artifacts
+statistichedirezionale/build/
+build/
+
+# Allow directories
+!*/

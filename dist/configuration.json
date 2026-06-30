@@ -1,0 +1,100 @@
+{
+  "BC_type": "SAAS",
+  "first_time": "yes",
+  "cust": "no",
+  "sender_email": "pyodatamail@gmail.com",
+  "receiver_email": [
+      "giorgia.lotta@serinf.it",
+      "anna.vita@serinf.it"
+  ],
+  "password_mail": "ygggfmembneiqagl",
+  "connection_string": "",
+  "local_output_path": "\\\\sql\\BC_BOARD",
+  "IP": "",
+  "ServiceName": "",
+  "username": "",
+  "password": "",
+  "Port_onprem": "8080",
+  "client_id_saas": "485fb4bf-695b-4279-957a-1a71f5d588a4",
+  "client_secret_saas": "3oi8Q~-XQxQ1zZq6MBprkWrUbIaaqAb7jqC80cCD",
+  "tenant_id_saas": "2738320b-8979-4119-a5ea-714b16c8b3f7",
+  "export_full_txt": true,
+  "full_export_max_workers": 4,
+  "incremental_compare_enabled": true,
+  "incremental_compare_services": [
+    "GLEntry"
+  ],
+  "incremental_batch_size": 100,
+  "incremental_batch_workers": 8,
+  "incremental_storage_format": "parquet",
+  "incremental_keys_format": "parquet",
+  "align_output_field_names_with_sp": true,
+  "incremental_mode": "guaranteed_fast",
+  "incremental_partitioned_storage_services": [
+    "GLEntry"
+  ],
+  "incremental_skip_delete_scan_services": [
+    "GLEntry"
+  ],
+  "incremental_partitioned_months_back": 2,
+  "incremental_partitioned_full_reconcile_every": 0,
+  "incremental_watermark_overlap_minutes": 15,
+  "defServ_mov": [
+    "ChangeLogEntry",
+    "ValueEntryQry",
+    "PhysInventoryLedgerEntry",
+    "GLEntry"
+],
+  "defServ_mov_colRif": "SystemCreatedAt",
+  
+  "defServ_anag": [
+      "Vendor",
+      "Item",
+      "ItemCategory",
+      "Location",
+      "DimensionSetEntryQry",
+      "DimensionValue",
+      "GLAccountQry"
+    ],
+
+  "start_year": 2023,
+  "current_year": 2025,
+  "companies": [
+    {
+      "name": "ASYLA SRL",
+      "sanitized": "asylasrl",
+      "company_encoded": "ASYLA_SRL",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('ASYLA_SRL')/"
+    },
+    {
+      "name": "GESTIONI TOURING TH",
+      "sanitized": "gestionitouringth",
+      "company_encoded": "GESTIONI_TOURING_TH",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('GESTIONI_TOURING_TH')/"
+    },
+    {
+      "name": "Hotelturist Spa",
+      "sanitized": "hotelturistspa",
+      "company_encoded": "Hotelturist_Spa",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Hotelturist_Spa')/"
+    },
+    {
+      "name": "Laudato Srl",
+      "sanitized": "laudatosrl",
+      "company_encoded": "Laudato%20Srl",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Laudato%20Srl')/"
+    },
+    {
+      "name": "Mountain Resort Srl",
+      "sanitized": "mountainresortsrl",
+      "company_encoded": "Mountain_Resort_Srl",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Mountain_Resort_Srl')/"
+    },
+    {
+      "name": "TOURISM HOTEL ENGINEERING",
+      "sanitized": "tourismhotelengineering",
+      "company_encoded": "TOURISM_HOTEL_ENGINEERING",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('TOURISM_HOTEL_ENGINEERING')/"
+    }
+  ]
+}
