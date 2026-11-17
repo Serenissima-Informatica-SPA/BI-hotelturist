@@ -91,6 +91,12 @@
       "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('Mountain_Resort_Srl')/"
     },
     {
+      "name": "TH GESTIONI SPA",
+      "sanitized": "thgestionispa",
+      "company_encoded": "TH_GESTIONI_SPA",
+      "base_url": "https://api.businesscentral.dynamics.com/v2.0/2738320b-8979-4119-a5ea-714b16c8b3f7/Production/ODataV4/Company('TH_GESTIONI_SPA')/"
+    },
+    {
       "name": "TOURISM HOTEL ENGINEERING",
       "sanitized": "tourismhotelengineering",
       "company_encoded": "TOURISM_HOTEL_ENGINEERING",

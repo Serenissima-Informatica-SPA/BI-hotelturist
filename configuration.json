@@ -4,8 +4,8 @@
   "cust": "no",
   "sender_email": "pyodatamail@gmail.com",
   "receiver_email": [
-      "giorgia.lotta@serinf.it",
-      "anna.vita@serinf.it"
+    "giorgia.lotta@serinf.it",
+    "anna.vita@serinf.it"
   ],
   "password_mail": "ygggfmembneiqagl",
   "connection_string": "",
@@ -20,6 +20,7 @@
   "tenant_id_saas": "2738320b-8979-4119-a5ea-714b16c8b3f7",
   "export_full_txt": true,
   "full_export_max_workers": 4,
+  "force_full_non_incremental_always": true,
   "incremental_compare_enabled": true,
   "incremental_compare_services": [
     "GLEntry"
@@ -44,19 +45,17 @@
     "ValueEntryQry",
     "PhysInventoryLedgerEntry",
     "GLEntry"
-],
+  ],
   "defServ_mov_colRif": "SystemCreatedAt",
-  
   "defServ_anag": [
-      "Vendor",
-      "Item",
-      "ItemCategory",
-      "Location",
-      "DimensionSetEntryQry",
-      "DimensionValue",
-      "GLAccountQry"
-    ],
-
+    "Vendor",
+    "Item",
+    "ItemCategory",
+    "Location",
+    "DimensionSetEntryQry",
+    "DimensionValue",
+    "GLAccountQry"
+  ],
   "start_year": 2023,
   "current_year": 2025,
   "companies": [

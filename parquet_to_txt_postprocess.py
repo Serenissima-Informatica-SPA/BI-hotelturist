@@ -89,6 +89,16 @@ SERVICE_FIELD_MAPS_SP = {
 KEEP_ONLY_MAPPED_FIELDS = True
 
 
+def _to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
 def _find_source_column(columns, canonical_name):
     lower_map = {col.lower(): col for col in columns}
 
@@ -114,6 +124,139 @@ def _find_source_column(columns, canonical_name):
                 return col
 
     return None
+
+
+def _find_tzsi_amount_column(columns):
+    explicit = _find_column_by_candidates(
+        columns,
+        [
+            'TZSI_Amount_GL_And_Extra_GL',
+            'TZSI Amount G/L And Extra G/L',
+            'TZSIAmountGLAndExtraGL',
+            'TZSI_Amount_G_L_And_Extra_G_L',
+        ]
+    )
+    if explicit:
+        return explicit
+
+    for col in columns:
+        key = _normalize_column_key(col)
+        if 'tzsi' in key and 'amount' in key and 'extra' in key and 'gl' in key:
+            return col
+    return None
+
+
+def _find_tzsi_extra_column(columns):
+    explicit = _find_column_by_candidates(
+        columns,
+        [
+            'TZSI_Extra_GL',
+            'TZSI Extra G/L',
+            'TZSIExtraGL',
+            'TZSI_Extra_G_L',
+        ]
+    )
+    if explicit:
+        return explicit
+
+    for col in columns:
+        key = _normalize_column_key(col)
+        if 'tzsi' in key and 'extra' in key and 'gl' in key and 'amount' not in key:
+            return col
+    return None
+
+
+def _find_amount_target_column(columns):
+    # Evita match ambiguo su colonne come DebitAmount/CreditAmount.
+    lower_map = {str(col).lower(): col for col in columns}
+    if 'amount' in lower_map:
+        return lower_map['amount']
+    if 'for_amount' in lower_map:
+        return lower_map['for_amount']
+    return _find_source_column(columns, 'Amount')
+
+
+def _normalize_column_key(name):
+    raw = ''.join(ch.lower() for ch in str(name) if ch.isalnum())
+
+    # Alcuni nomi OData possono contenere token encoded come x0020/x002f.
+    # Li rimuoviamo per confronti piu' robusti.
+    out = []
+    i = 0
+    hexdigits = set('0123456789abcdef')
+    while i < len(raw):
+        if i + 4 < len(raw) and raw[i] == 'x' and all(ch in hexdigits for ch in raw[i + 1:i + 5]):
+            i += 5
+            continue
+        out.append(raw[i])
+        i += 1
+
+    return ''.join(out)
+
+
+def _find_column_by_candidates(columns, candidates):
+    if not columns:
+        return None
+
+    lower_map = {str(col).lower(): col for col in columns}
+    normalized_map = {_normalize_column_key(col): col for col in columns}
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        candidate_str = str(candidate)
+        exact = lower_map.get(candidate_str.lower())
+        if exact:
+            return exact
+
+        normalized = normalized_map.get(_normalize_column_key(candidate_str))
+        if normalized:
+            return normalized
+
+    normalized_candidates = {_normalize_column_key(candidate) for candidate in candidates if candidate is not None}
+    for col in columns:
+        col_key = _normalize_column_key(col)
+        if not col_key:
+            continue
+        for candidate_key in normalized_candidates:
+            if col_key.endswith(candidate_key):
+                return col
+
+    return None
+
+
+def _normalize_glentry_custom_fields(df, service_name):
+    if df is None or df.empty or service_name != 'GLEntry':
+        return df
+
+    df_out = df.copy()
+    columns = list(df_out.columns)
+
+    amount_col = _find_amount_target_column(columns)
+    tzsi_amount_col = _find_tzsi_amount_column(columns)
+
+    # Mantiene il nome finale Amount, sostituendo solo i valori.
+    if tzsi_amount_col:
+        if amount_col and amount_col != tzsi_amount_col:
+            df_out[amount_col] = df_out[tzsi_amount_col]
+        elif not amount_col:
+            df_out['Amount'] = df_out[tzsi_amount_col]
+
+    columns = list(df_out.columns)
+    tzsi_extra_col = _find_tzsi_extra_column(columns)
+
+    if tzsi_extra_col:
+        source_code_col = _find_source_column(columns, 'SourceCode')
+        if not source_code_col:
+            source_code_col = 'SourceCode'
+            df_out[source_code_col] = ''
+
+        extra_true_mask = df_out[tzsi_extra_col].apply(lambda v: _to_bool(v, False))
+        if extra_true_mask.any():
+            df_out.loc[extra_true_mask, source_code_col] = 'NOGIORN'
+
+    return df_out
 
 
 def _apply_sp_field_mapping(df, service_name):
@@ -149,6 +292,29 @@ def _apply_sp_field_mapping(df, service_name):
                 occupied_targets.add(clean_lower)
 
     df_out = df.rename(columns=rename_map) if rename_map else df
+
+    if service_name == 'GLEntry' and df is not None and not df.empty:
+        source_columns = list(df.columns)
+        tzsi_amount_col = _find_tzsi_amount_column(source_columns)
+        if tzsi_amount_col:
+            amount_target_col = _find_amount_target_column(list(df_out.columns))
+            if amount_target_col:
+                df_out[amount_target_col] = df[tzsi_amount_col].values
+
+        tzsi_extra_col = _find_tzsi_extra_column(source_columns)
+        if tzsi_extra_col is not None:
+            source_code_target_col = None
+            if 'Source Code' in df_out.columns:
+                source_code_target_col = 'Source Code'
+            elif 'SourceCode' in df_out.columns:
+                source_code_target_col = 'SourceCode'
+            else:
+                source_code_target_col = _find_source_column(list(df_out.columns), 'SourceCode')
+
+            if source_code_target_col:
+                extra_true_mask = df[tzsi_extra_col].apply(lambda v: _to_bool(v, False)).values
+                if extra_true_mask.any():
+                    df_out.loc[extra_true_mask, source_code_target_col] = 'NOGIORN'
 
     if not KEEP_ONLY_MAPPED_FIELDS:
         return df_out
@@ -214,6 +380,29 @@ def _service_folder_name(service_name, company_sanitized):
     return f"{service_name.replace('Qry', '').replace('_', '').lower()}-{company_sanitized}"
 
 
+def _should_use_partitioned_source(partition_dir, parquet_path):
+    if not os.path.isdir(partition_dir):
+        return False
+
+    part_files = [
+        os.path.join(partition_dir, name)
+        for name in os.listdir(partition_dir)
+        if name.lower().endswith('.parquet') and os.path.getsize(os.path.join(partition_dir, name)) > 0
+    ]
+    if not part_files:
+        return False
+
+    # Se il parquet monolitico esiste ed e' piu' recente delle partizioni,
+    # preferiamo il monolitico (tipico dopo rebuild full one-shot).
+    if os.path.exists(parquet_path) and os.path.getsize(parquet_path) > 0:
+        latest_part_mtime = max(os.path.getmtime(path) for path in part_files)
+        parquet_mtime = os.path.getmtime(parquet_path)
+        if parquet_mtime >= latest_part_mtime:
+            return False
+
+    return True
+
+
 def _write_txt(df, txt_path):
     os.makedirs(os.path.dirname(txt_path), exist_ok=True)
     if df is None or df.empty:
@@ -233,6 +422,7 @@ def _convert_single_parquet(parquet_path, txt_path, company_sanitized):
         df = pd.read_parquet(parquet_path)
         df = _add_reference_company(df, company_sanitized)
         service_name = os.path.splitext(os.path.basename(parquet_path))[0]
+        df = _normalize_glentry_custom_fields(df, service_name)
         df = _apply_sp_field_mapping(df, service_name)
         rows = _write_txt(df, txt_path)
         return True, rows, f'Convertito {parquet_path} -> {txt_path}'
@@ -266,6 +456,7 @@ def _convert_partitioned_parquet(partition_dir, txt_path, company_sanitized):
 
             df_part = pd.read_parquet(parquet_file)
             df_part = _add_reference_company(df_part, company_sanitized)
+            df_part = _normalize_glentry_custom_fields(df_part, service_name)
             df_part = _apply_sp_field_mapping(df_part, service_name)
 
             if expected_columns is None:
@@ -338,7 +529,7 @@ def main():
             parquet_path = os.path.join(output_folder, f'{service_name}.parquet')
             partition_dir = os.path.join(output_folder, f'{service_name}__parts')
 
-            if os.path.isdir(partition_dir):
+            if _should_use_partitioned_source(partition_dir, parquet_path):
                 ok, rows, message = _convert_partitioned_parquet(partition_dir, txt_path, company_sanitized)
             else:
                 ok, rows, message = _convert_single_parquet(parquet_path, txt_path, company_sanitized)

@@ -304,7 +304,7 @@ incremental_partitioned_months_back = int(config.get('incremental_partitioned_mo
 incremental_partitioned_full_reconcile_every = int(config.get('incremental_partitioned_full_reconcile_every', 0))
 incremental_partitioned_storage_services = set(config.get('incremental_partitioned_storage_services', []))
 incremental_skip_delete_scan_services = set(config.get('incremental_skip_delete_scan_services', []))
-incremental_changelog_delete_services = set(config.get('incremental_changelog_delete_services', ['GLEntry']))
+incremental_changelog_delete_services = set(config.get('incremental_changelog_delete_services', []))
 incremental_changelog_service_name = config.get('incremental_changelog_service_name', 'ChangeLogEntry')
 incremental_changelog_systemid_field = config.get('incremental_changelog_systemid_field', 'ChangedRecordSystemId')
 incremental_changelog_datetime_field = config.get('incremental_changelog_datetime_field', 'DateandTime')
@@ -315,6 +315,20 @@ incremental_keys_format = str(
 ).strip().lower()
 use_parquet_keys = incremental_keys_format == 'parquet'
 odata_maxpagesize = int(config.get('odata_maxpagesize', 2000))
+
+# Override operativo: forza sempre caricamento completo non incrementale.
+force_full_non_incremental_always = str(
+    config.get('force_full_non_incremental_always', True)
+).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+if incremental_changelog_delete_services:
+    print("[CONFIG] incremental_changelog_delete_services ignorato: ChangeLogEntry non qualifica delete/tabella; uso snapshot SystemId")
+    incremental_changelog_delete_services = set()
+
+if force_full_non_incremental_always:
+    export_full_txt = True
+    incremental_compare_enabled = False
+    print("[CONFIG] force_full_non_incremental_always=True -> esecuzione FULL senza incremental compare")
 
 
 def _to_bool(value, default=False):
@@ -429,6 +443,139 @@ def _find_source_column(columns, canonical_name):
     return None
 
 
+def _find_tzsi_amount_column(columns):
+    explicit = _find_column_by_candidates(
+        columns,
+        [
+            'TZSI_Amount_GL_And_Extra_GL',
+            'TZSI Amount G/L And Extra G/L',
+            'TZSIAmountGLAndExtraGL',
+            'TZSI_Amount_G_L_And_Extra_G_L',
+        ]
+    )
+    if explicit:
+        return explicit
+
+    for col in columns:
+        key = _normalize_column_key(col)
+        if 'tzsi' in key and 'amount' in key and 'extra' in key and 'gl' in key:
+            return col
+    return None
+
+
+def _find_tzsi_extra_column(columns):
+    explicit = _find_column_by_candidates(
+        columns,
+        [
+            'TZSI_Extra_GL',
+            'TZSI Extra G/L',
+            'TZSIExtraGL',
+            'TZSI_Extra_G_L',
+        ]
+    )
+    if explicit:
+        return explicit
+
+    for col in columns:
+        key = _normalize_column_key(col)
+        if 'tzsi' in key and 'extra' in key and 'gl' in key and 'amount' not in key:
+            return col
+    return None
+
+
+def _find_amount_target_column(columns):
+    # Evita match ambiguo su colonne come DebitAmount/CreditAmount.
+    lower_map = {str(col).lower(): col for col in columns}
+    if 'amount' in lower_map:
+        return lower_map['amount']
+    if 'for_amount' in lower_map:
+        return lower_map['for_amount']
+    return _find_source_column(columns, 'Amount')
+
+
+def _normalize_column_key(name):
+    raw = ''.join(ch.lower() for ch in str(name) if ch.isalnum())
+
+    # Alcuni nomi OData possono contenere token encoded come x0020/x002f.
+    # Li rimuoviamo per confronti piu' robusti.
+    out = []
+    i = 0
+    hexdigits = set('0123456789abcdef')
+    while i < len(raw):
+        if i + 4 < len(raw) and raw[i] == 'x' and all(ch in hexdigits for ch in raw[i + 1:i + 5]):
+            i += 5
+            continue
+        out.append(raw[i])
+        i += 1
+
+    return ''.join(out)
+
+
+def _find_column_by_candidates(columns, candidates):
+    if not columns:
+        return None
+
+    lower_map = {str(col).lower(): col for col in columns}
+    normalized_map = {_normalize_column_key(col): col for col in columns}
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        candidate_str = str(candidate)
+        exact = lower_map.get(candidate_str.lower())
+        if exact:
+            return exact
+
+        normalized = normalized_map.get(_normalize_column_key(candidate_str))
+        if normalized:
+            return normalized
+
+    normalized_candidates = {_normalize_column_key(candidate) for candidate in candidates if candidate is not None}
+    for col in columns:
+        col_key = _normalize_column_key(col)
+        if not col_key:
+            continue
+        for candidate_key in normalized_candidates:
+            if col_key.endswith(candidate_key):
+                return col
+
+    return None
+
+
+def _normalize_glentry_custom_fields(df, service_name):
+    if df is None or df.empty or service_name != 'GLEntry':
+        return df
+
+    df_out = df.copy()
+    columns = list(df_out.columns)
+
+    amount_col = _find_amount_target_column(columns)
+    tzsi_amount_col = _find_tzsi_amount_column(columns)
+
+    # Mantiene il nome logico Amount in output, sostituendo solo i valori.
+    if tzsi_amount_col:
+        if amount_col and amount_col != tzsi_amount_col:
+            df_out[amount_col] = df_out[tzsi_amount_col]
+        elif not amount_col:
+            df_out['Amount'] = df_out[tzsi_amount_col]
+
+    columns = list(df_out.columns)
+    tzsi_extra_col = _find_tzsi_extra_column(columns)
+
+    if tzsi_extra_col:
+        source_code_col = _find_source_column(columns, 'SourceCode')
+        if not source_code_col:
+            source_code_col = 'SourceCode'
+            df_out[source_code_col] = df_out.get(source_code_col, '')
+
+        extra_true_mask = df_out[tzsi_extra_col].apply(lambda v: _to_bool(v, False))
+        if extra_true_mask.any():
+            df_out.loc[extra_true_mask, source_code_col] = 'NOGIORN'
+
+    return df_out
+
+
 def _apply_sp_field_mapping(df, service_name):
     if df is None:
         return pd.DataFrame()
@@ -463,10 +610,32 @@ def _apply_sp_field_mapping(df, service_name):
                 rename_map[col] = clean
                 occupied_targets.add(clean_lower)
 
-    if not rename_map:
-        return df
+    df_out = df.rename(columns=rename_map) if rename_map else df
 
-    return df.rename(columns=rename_map)
+    if service_name == 'GLEntry' and df is not None and not df.empty:
+        source_columns = list(df.columns)
+        tzsi_amount_col = _find_tzsi_amount_column(source_columns)
+        if tzsi_amount_col:
+            amount_target_col = _find_amount_target_column(list(df_out.columns))
+            if amount_target_col:
+                df_out[amount_target_col] = df[tzsi_amount_col].values
+
+        tzsi_extra_col = _find_tzsi_extra_column(source_columns)
+        if tzsi_extra_col is not None:
+            source_code_target_col = None
+            if 'Source Code' in df_out.columns:
+                source_code_target_col = 'Source Code'
+            elif 'SourceCode' in df_out.columns:
+                source_code_target_col = 'SourceCode'
+            else:
+                source_code_target_col = _find_source_column(list(df_out.columns), 'SourceCode')
+
+            if source_code_target_col:
+                extra_true_mask = df[tzsi_extra_col].apply(lambda v: _to_bool(v, False)).values
+                if extra_true_mask.any():
+                    df_out.loc[extra_true_mask, source_code_target_col] = 'NOGIORN'
+
+    return df_out
 
 
 def _add_reference_company(df, company_sanitized):
@@ -867,6 +1036,7 @@ def salva_dataframe_txt(df, output_folder, service_name, company_sanitized=None)
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.txt")
     df = _add_reference_company(df, company_sanitized) if company_sanitized else df
+    df = _normalize_glentry_custom_fields(df, service_name)
     df = _apply_sp_field_mapping(df, service_name)
     if df is None or df.empty:
         # Crea comunque il file per mantenere un output consistente per ogni tabella.
@@ -882,6 +1052,7 @@ def salva_dataframe_parquet(df, output_folder, service_name, company_sanitized=N
     os.makedirs(output_folder, exist_ok=True)
     output_file = os.path.join(output_folder, f"{service_name}.parquet")
     df = _add_reference_company(df, company_sanitized) if company_sanitized else df
+    df = _normalize_glentry_custom_fields(df, service_name)
     df_out = _apply_sp_field_mapping(df, service_name)
     df_out.to_parquet(output_file, index=False)
     return output_file
@@ -921,6 +1092,7 @@ def _save_partitioned_parquet_output(df, output_folder, service_name, col_rif, c
     partition_root = _partition_root_path(output_folder, service_name)
     os.makedirs(partition_root, exist_ok=True)
     df = _add_reference_company(df, company_sanitized) if company_sanitized else df
+    df = _normalize_glentry_custom_fields(df, service_name)
 
     if df is None or df.empty:
         return partition_root
@@ -1191,7 +1363,14 @@ def _load_watermark(watermark_path):
         return None
     with open(watermark_path, 'r', encoding='utf-8') as f:
         ts = f.read().strip()
-    return ts if ts else None
+    if not ts:
+        return None
+    try:
+        if datetime.strptime(ts[:19].replace(' ', 'T'), '%Y-%m-%dT%H:%M:%S').year <= 1:
+            return None
+    except ValueError:
+        return None
+    return ts
 
 
 def _save_watermark(ts, watermark_path):
@@ -1205,6 +1384,8 @@ def _fetch_since_watermark(service_url, watermark_ts, overlap_minutes,
     try:
         dt = datetime.strptime(watermark_ts[:19].replace(' ', 'T'), '%Y-%m-%dT%H:%M:%S')
     except ValueError:
+        dt = datetime.utcnow() - timedelta(hours=1)
+    if dt.year <= 1:
         dt = datetime.utcnow() - timedelta(hours=1)
     dt_with_overlap = dt - timedelta(minutes=overlap_minutes)
     filter_ts = dt_with_overlap.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1221,6 +1402,8 @@ def _fetch_deleted_ids_from_changelog(base_url, watermark_ts, overlap_minutes,
     except ValueError:
         dt = datetime.utcnow() - timedelta(hours=1)
 
+    if dt.year <= 1:
+        dt = datetime.utcnow() - timedelta(hours=1)
     dt_with_overlap = dt - timedelta(minutes=overlap_minutes)
     filter_ts = dt_with_overlap.strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -1265,8 +1448,11 @@ def _upsert_by_system_id(df_base, df_delta):
     return out.drop_duplicates(subset=['SystemId'], keep='last').reset_index(drop=True)
 
 
-def _merge_incremental_txt_file(txt_path, df_delta, deleted_ids):
+def _merge_incremental_txt_file(txt_path, df_delta, deleted_ids, service_name=None):
     deleted_ids = {str(item) for item in deleted_ids if pd.notna(item)}
+
+    if service_name:
+        df_delta = _normalize_glentry_custom_fields(df_delta, service_name)
 
     # Fast path: nessun delta e nessun delete -> evita riscrittura completa del file.
     if (df_delta is None or df_delta.empty or 'SystemId' not in df_delta.columns) and not deleted_ids:
@@ -1401,6 +1587,9 @@ def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids, service
     deleted_ids = {str(item) for item in deleted_ids if pd.notna(item)}
 
     if service_name:
+        df_delta = _normalize_glentry_custom_fields(df_delta, service_name)
+
+    if service_name:
         df_delta = _apply_sp_field_mapping(df_delta, service_name)
 
     has_delta = df_delta is not None and (not df_delta.empty) and ('SystemId' in df_delta.columns)
@@ -1437,7 +1626,7 @@ def _merge_incremental_parquet_file(parquet_path, df_delta, deleted_ids, service
 def _merge_incremental_output_file(path, df_delta, deleted_ids, use_parquet, service_name=None):
     if use_parquet:
         return _merge_incremental_parquet_file(path, df_delta, deleted_ids, service_name)
-    return _merge_incremental_txt_file(path, df_delta, deleted_ids)
+    return _merge_incremental_txt_file(path, df_delta, deleted_ids, service_name)
 
 
 def _merge_partitioned_parquet_output(output_folder, service_name, df_delta, deleted_ids, prev_keys, col_rif):
@@ -1490,7 +1679,11 @@ def _merge_partitioned_parquet_output(output_folder, service_name, df_delta, del
 
 
 def _write_incremental_report_html(company_name, company_sanitized, rows, output_path):
-    report_file = os.path.join(output_path, f"incremental-report-{company_sanitized}.html")
+    report_file = os.path.join(
+        output_path,
+        f"incremental-report-{company_sanitized}-"
+        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+    )
 
     if not rows:
         body = f"""
@@ -1659,6 +1852,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             if not watermark_ts:
                 watermark_ts = datetime.utcnow().strftime('%Y-%m-%dT00:00:00Z')
 
+            print(f"[INCREMENTAL] {service_name}: download delta dal watermark {watermark_ts}")
             changed_data = _fetch_since_watermark(
                 service_url,
                 watermark_ts,
@@ -1671,6 +1865,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                 client_secret
             )
             df_delta = pd.DataFrame(changed_data) if changed_data else pd.DataFrame()
+            print(f"[INCREMENTAL] {service_name}: download completato, {len(df_delta)} record ricevuti")
 
             if not df_delta.empty and 'SystemId' in df_delta.columns:
                 df_delta['SystemId'] = df_delta['SystemId'].astype(str)
@@ -1683,34 +1878,19 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
             updated_ids = delta_ids & prev_ids_set
 
             delete_mode = 'snapshot'
-            if service_name in incremental_changelog_delete_services:
-                deleted_ids = _fetch_deleted_ids_from_changelog(
-                    base_url,
-                    watermark_ts,
-                    incremental_watermark_overlap_minutes,
-                    bc_type,
-                    username,
-                    password,
-                    tenant_id,
-                    client_id,
-                    client_secret,
-                    incremental_changelog_service_name,
-                    incremental_changelog_systemid_field,
-                    incremental_changelog_datetime_field
-                )
-                # Applica delete solo agli ID gia' presenti nello snapshot locale.
-                deleted_ids = deleted_ids & prev_ids_set
-                delete_mode = 'changelog'
-            elif service_name not in incremental_skip_delete_scan_services:
+            if service_name not in incremental_skip_delete_scan_services:
+                print(f"[INCREMENTAL] {service_name}: confronto snapshot SystemId per rilevare delete")
                 curr_ids_set = _fetch_id_set(service_url, bc_type, username, password, tenant_id, client_id, client_secret)
                 deleted_ids = prev_ids_set - curr_ids_set
                 delete_mode = 'snapshot'
             else:
                 deleted_ids = set()
                 delete_mode = 'none'
+                print(f"[INCREMENTAL] {service_name}: delete scan disattivato dalla configurazione")
 
             no_changes = (not delta_ids) and (not deleted_ids)
             if no_changes:
+                print(f"[INCREMENTAL] {service_name}: nessuna variazione rilevata")
                 changes_log_path = _write_changed_records_log(output_folder, service_name, [])
                 report_info['Inserted'] = 0
                 report_info['Updated'] = 0
@@ -1740,6 +1920,7 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                     df_delta['SystemModifiedAt'] = pd.NA
                 delta_keys = _extract_partition_parts(df_delta, col_rif)[['SystemId', 'SystemModifiedAt', 'PartitionYear', 'PartitionMonth']].copy()
 
+            print(f"[INCREMENTAL] {service_name}: applicazione delta ({len(df_delta)} record, {len(deleted_ids)} delete)")
             if use_partitioned_storage:
                 _merge_partitioned_parquet_output(output_folder, service_name, df_delta, deleted_ids, prev_keys, col_rif)
             else:
@@ -1757,12 +1938,17 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
                 if max_ts:
                     new_watermark = str(max_ts)[:19].replace(' ', 'T') + 'Z'
             _save_watermark(new_watermark, watermark_path)
+            print(f"[INCREMENTAL] {service_name}: completato, watermark aggiornato a {new_watermark}")
 
             prev_modif_map = {}
-            if not prev_keys.empty:
+            changed_ids_for_log = inserted_ids | updated_ids | deleted_ids
+            if not prev_keys.empty and changed_ids_for_log:
+                prev_keys_for_log = prev_keys[
+                    prev_keys['SystemId'].astype(str).isin(changed_ids_for_log)
+                ]
                 prev_modif_map = {
                     str(row['SystemId']): str(row.get('SystemModifiedAt', ''))
-                    for _, row in prev_keys.iterrows()
+                    for _, row in prev_keys_for_log.iterrows()
                 }
 
             changed_records_rows = []
@@ -2125,6 +2311,8 @@ def export_single_service_txt(service_name, company_sanitized, base_url, bc_type
 
 print(f"\n{'='*80}")
 print(f"ELABORAZIONE INIZIATA - {len(companies_list)} COMPANY DA PROCESSARE")
+run_started_at = time.perf_counter()
+print(f"[TIMING] Avvio processo: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 for i, c in enumerate(companies_list, 1):
     print(f"  {i}. {c['name']} ({c['sanitized']})")
 print(f"{'='*80}\n")
@@ -2136,6 +2324,7 @@ all_log_data_anag = []
 
 # Cicla su tutte le company configurate
 for company_config in companies_list:
+    company_started_at = time.perf_counter()
     print(f"\n{'='*80}")
     print(f"INIZIO ELABORAZIONE: {company_config['name']} ({company_config['sanitized']})")
     print(f"{'='*80}\n")
@@ -2156,8 +2345,9 @@ for company_config in companies_list:
     defServ['container_name_corr'] = defServ['transformed_string'] + "corrente-" + company_sanitized
     defServ['container_name_stor'] = defServ['transformed_string'] + "storico-" + company_sanitized
 
-    defServ_anag = pd.DataFrame(columns=['Service'])
-    defServ_anag['Service'] = config.get('defServ_anag', '')
+    defServ_anag = pd.DataFrame({
+        'Service': pd.Series(config.get('defServ_anag', []), dtype='string')
+    })
     defServ_anag['ColRif'] = config.get('defServ_mov_colRif', '')
     defServ_anag['transformed_string'] = defServ_anag['Service'].apply(lambda x: x.replace("Qry", "").lower()) 
     defServ_anag['container_name_corr'] = defServ_anag['transformed_string'] + "corrente-" + company_sanitized
@@ -2172,6 +2362,7 @@ for company_config in companies_list:
         workers = max(1, min(full_export_max_workers, len(servizi_totali)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {}
+            future_started_at = {}
             for _, service_row in servizi_totali.iterrows():
                 service_name = service_row['Service']
                 service_col_rif = service_row.get('ColRif', '') or ''
@@ -2190,18 +2381,22 @@ for company_config in companies_list:
                     service_col_rif
                 )
                 future_map[future] = service_name
+                future_started_at[future] = time.perf_counter()
 
             for future in as_completed(future_map):
                 service_name = future_map[future]
                 try:
                     service_name_ret, row_count, txt_path, report_info = future.result()
-                    print(f"Tabella {service_name_ret}: esportati {row_count} record in {txt_path}")
+                    elapsed = time.perf_counter() - future_started_at[future]
+                    print(f"Tabella {service_name_ret}: esportati {row_count} record in {txt_path} | [TIMING] {elapsed:.1f}s")
                     incremental_report_rows.append(report_info)
                 except Exception as e:
                     print(f"Errore export tabella {service_name}: {e}")
 
+        print(f"[STEP] {company_config['name']}: tutte le tabelle completate; avvio scrittura report", flush=True)
         report_file = _write_incremental_report_html(company_config['name'], company_sanitized, incremental_report_rows, base_path)
-        print(f"Report incrementale salvato in {report_file}")
+        print(f"Report incrementale salvato in {report_file}", flush=True)
+        print(f"[TIMING] Company {company_config['name']}: {time.perf_counter() - company_started_at:.1f}s", flush=True)
 
         print(f"--- Fine EXPORT FULL TXT per company: {company_config['name']} ---\n")
         continue
